@@ -8,7 +8,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Environment(str, Enum):
@@ -277,6 +277,22 @@ class MarketTicker(BaseModel):
     expiration_time: datetime | None = None
     exchange_index: int | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fallback_legacy_cent_quotes(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        for d_key, c_key in (
+            ("yes_bid_dollars", "yes_bid"),
+            ("yes_ask_dollars", "yes_ask"),
+            ("no_bid_dollars", "no_bid"),
+            ("no_ask_dollars", "no_ask"),
+        ):
+            if out.get(d_key) is None and out.get(c_key) is not None:
+                out[d_key] = Decimal(str(out[c_key])) / Decimal("100")
+        return out
+
     @property
     def expiry_dt(self) -> datetime | None:
         return self.close_time or self.expiration_time
@@ -293,7 +309,8 @@ class MarketTicker(BaseModel):
     def parse_opt_decimal(cls, v: object) -> Decimal | None:
         if v is None or v == "":
             return None
-        return _to_decimal(v)
+        d = _to_decimal(v)
+        return (d / Decimal("100")) if d > Decimal("1.00") else d
 
     @field_validator("volume_fp", mode="before")
     @classmethod

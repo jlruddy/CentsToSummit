@@ -30,8 +30,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SYSTEM_PROMPT = (
     "You are an independent prediction-market microstructure research agent analyzing "
-    "a batch of live Kalshi orderbooks. Return ONLY a valid JSON array of trade objects "
-    '(or [] if all markets are HOLD). Each trade object MUST have keys: '
+    "a batch of live Kalshi orderbooks. Only propose a trade when the expected settlement "
+    "or short-term move exceeds $0.04 (4 cents) per contract AFTER crossing the current "
+    "spread; otherwise return [] (HOLD). Return ONLY a valid JSON array of trade objects: "
     '{"ticker": "TICKER", "side": "bid"|"ask", "count": "2", '
     '"limit_price": "0.5200", "expected_edge_per_contract": "0.05", '
     '"hold_to_expiry": true, "confidence": "0.75", "rationale": "short reason"}. '
@@ -212,14 +213,20 @@ class StubMomentumStrategy(BaseStrategy):
         ref_price = snapshot.mid_yes_price if snapshot.mid_yes_price is not None else levels[0].price
         max_slip_dollars = self.settings.max_slippage_cents / Decimal("100")
         avail = Decimal("0")
-        limit_px = levels[0].price
+        inside_px = levels[0].price
+        limit_px = inside_px
         for lvl in levels:
             slip = (
                 max(Decimal("0"), lvl.price - ref_price)
                 if side == OrderSide.BID
                 else max(Decimal("0"), ref_price - lvl.price)
             )
-            if slip <= max_slip_dollars:
+            within_inside_plus_1c = (
+                (lvl.price <= inside_px + Decimal("0.01"))
+                if side == OrderSide.BID
+                else (lvl.price >= inside_px - Decimal("0.01"))
+            )
+            if slip <= max_slip_dollars and within_inside_plus_1c:
                 avail += lvl.count
                 limit_px = lvl.price
         return avail, limit_px
@@ -279,8 +286,16 @@ class StubMomentumStrategy(BaseStrategy):
         history = self._mid_history.setdefault(snapshot.ticker, deque(maxlen=10))
         history.append(mid)
 
-        yes_top_vol = sum((lvl.count for lvl in snapshot.yes_bids[-3:]), Decimal("0"))
-        no_top_vol = sum((lvl.count for lvl in snapshot.no_bids[-3:]), Decimal("0"))
+        yes_top_vol = (
+            min(snapshot.yes_bids[-1].count, Decimal("500"))
+            if snapshot.yes_bids
+            else Decimal("0")
+        )
+        no_top_vol = (
+            min(snapshot.no_bids[-1].count, Decimal("500"))
+            if snapshot.no_bids
+            else Decimal("0")
+        )
         total_vol = yes_top_vol + no_top_vol
         imbalance = (
             ((yes_top_vol - no_top_vol) / total_vol) if total_vol > Decimal("0") else Decimal("0")
@@ -494,10 +509,19 @@ class _LLMStrategyBase(BaseStrategy):
 
     @staticmethod
     def _compute_imbalance(snapshot: OrderbookSnapshot) -> Decimal:
-        yes_top = sum((lvl.count for lvl in snapshot.yes_bids[-3:]), Decimal("0"))
-        no_top = sum((lvl.count for lvl in snapshot.no_bids[-3:]), Decimal("0"))
-        total = yes_top + no_top
-        return ((yes_top - no_top) / total) if total > Decimal("0") else Decimal("0")
+        """Compute Level 1 inside bid/ask imbalance with each level capped at 500 contracts."""
+        bid_size_1 = (
+            min(snapshot.yes_bids[-1].count, Decimal("500"))
+            if snapshot.yes_bids
+            else Decimal("0")
+        )
+        ask_size_1 = (
+            min(snapshot.no_bids[-1].count, Decimal("500"))
+            if snapshot.no_bids
+            else Decimal("0")
+        )
+        total = bid_size_1 + ask_size_1
+        return ((bid_size_1 - ask_size_1) / total) if total > Decimal("0") else Decimal("0")
 
     def _should_trigger_llm(
         self,
@@ -561,10 +585,12 @@ class _LLMStrategyBase(BaseStrategy):
                     "price_delta_since_last": f"{delta:+.4f}",
                     "imbalance": f"{self._compute_imbalance(snap):+.2f}",
                     "top3_yes_bids": [
-                        [str(l.price), str(l.count)] for l in reversed(snap.yes_bids[-3:])
+                        [str(l.price), str(min(l.count, Decimal("500")))]
+                        for l in reversed(snap.yes_bids[-3:])
                     ],
                     "top3_yes_asks": [
-                        [str(l.price), str(l.count)] for l in snap.effective_yes_asks[:3]
+                        [str(l.price), str(min(l.count, Decimal("500")))]
+                        for l in snap.effective_yes_asks[:3]
                     ],
                 }
             )
@@ -597,7 +623,8 @@ class _LLMStrategyBase(BaseStrategy):
         snapshots: list[OrderbookSnapshot],
         latency_ms: int,
     ) -> list[TradeIntent]:
-        valid_tickers = {s.ticker for s in snapshots}
+        snap_map = {s.ticker: s for s in snapshots}
+        max_slip_dollars = self.settings.max_slippage_cents / Decimal("100")
         try:
             text = raw_text.strip()
             if "```" in text:
@@ -620,8 +647,52 @@ class _LLMStrategyBase(BaseStrategy):
                 if str(item.get("action", "trade")).lower() == "hold":
                     continue
                 ticker = str(item.get("ticker", ""))
-                if ticker not in valid_tickers:
+                snap = snap_map.get(ticker)
+                if snap is None or snap.best_yes_bid is None or snap.best_yes_ask is None:
                     continue
+                side = OrderSide(str(item["side"]).lower())
+                raw_price = Decimal(str(item["limit_price"]))
+                # Abort if live inside quote moved > max_slippage past AI reference price;
+                # otherwise clamp limit_price to at most inside_ask + $0.01 on that side.
+                if side == OrderSide.BID:
+                    inside_ask = snap.best_yes_ask
+                    if (inside_ask - raw_price) > max_slip_dollars:
+                        logger.info(
+                            "[SLIPPAGE_ABORT] ticker=%s side=bid ref_price=%s inside_ask=%s max_slip=%s",
+                            ticker,
+                            raw_price,
+                            inside_ask,
+                            max_slip_dollars,
+                        )
+                        continue
+                    limit_px = min(
+                        max(raw_price, inside_ask),
+                        inside_ask + Decimal("0.01"),
+                        raw_price + max_slip_dollars,
+                    )
+                else:
+                    inside_bid = snap.best_yes_bid
+                    if (raw_price - inside_bid) > max_slip_dollars:
+                        logger.info(
+                            "[SLIPPAGE_ABORT] ticker=%s side=ask ref_price=%s inside_bid=%s max_slip=%s",
+                            ticker,
+                            raw_price,
+                            inside_bid,
+                            max_slip_dollars,
+                        )
+                        continue
+                    limit_px = max(
+                        min(raw_price, inside_bid),
+                        inside_bid - Decimal("0.01"),
+                        raw_price - max_slip_dollars,
+                    )
+
+                if not (
+                    Decimal("0.15") <= limit_px <= Decimal("0.85")
+                    and Decimal("0.15") <= (Decimal("1.00") - limit_px) <= Decimal("0.85")
+                ):
+                    continue
+
                 count_dec = Decimal(str(item["count"]))
                 if "expected_edge_per_contract" in item and item["expected_edge_per_contract"] is not None:
                     edge_per_c = Decimal(str(item["expected_edge_per_contract"]))
@@ -639,9 +710,9 @@ class _LLMStrategyBase(BaseStrategy):
                     TradeIntent(
                         timestamp_ms=ts_ms,
                         ticker=ticker,
-                        side=OrderSide(str(item["side"]).lower()),
+                        side=side,
                         count=count_dec,
-                        limit_price=Decimal(str(item["limit_price"])),
+                        limit_price=limit_px,
                         expected_edge_dollars=total_edge,
                         expected_edge_per_contract=edge_per_c,
                         hold_to_expiry=bool(item.get("hold_to_expiry", False)),
@@ -718,7 +789,7 @@ class _LLMStrategyBase(BaseStrategy):
             t0 = time.perf_counter()
             try:
                 raw_text, p_tok, c_tok = await asyncio.wait_for(
-                    self._call_llm_batch(prompt), timeout=25.0
+                    self._call_llm_batch(prompt), timeout=8.0
                 )
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
@@ -790,7 +861,7 @@ class AnthropicStrategy(_LLMStrategyBase):
         if not self.settings.llm_api_key:
             raise ValueError("LLM API key not configured")
         endpoint = self.settings.llm_endpoint or "https://api.anthropic.com/v1/messages"
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
                 endpoint,
                 headers={
@@ -828,7 +899,7 @@ class GeminiStrategy(_LLMStrategyBase):
             "x-goog-api-key": self.settings.llm_api_key,
             "content-type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             base_payload = {
                 "system_instruction": {"parts": [{"text": self._system_prompt()}]},
                 "contents": [{"parts": [{"text": prompt}]}],
@@ -872,7 +943,7 @@ class OllamaLocalStrategy(_LLMStrategyBase):
 
     async def _call_llm_batch(self, prompt: str) -> tuple[str, int, int]:
         endpoint = self.settings.llm_endpoint or "http://127.0.0.1:11434/api/chat"
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
                 endpoint,
                 json={

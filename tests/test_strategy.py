@@ -236,3 +236,62 @@ async def test_gemini_thinking_config_400_fallback_and_timeout_repr() -> None:
     assert "TimeoutError" in res.decisions[0]["rationale"]
     assert not strat._inflight_lock.locked()
     assert strat._last_llm_call_monotonic > 0
+
+
+async def test_level1_imbalance_ignores_deep_outliers_and_clamps_crossing_price() -> None:
+    import json
+    from unittest.mock import AsyncMock, patch
+    from kalshi_poc.models import StrategyProvider
+    from kalshi_poc.strategy_ai import GeminiStrategy
+
+    settings = AppSettings(
+        _env_file=None,
+        strategy_provider=StrategyProvider.GEMINI,
+        llm_api_key="test-key",
+        max_slippage_cents=Decimal("3"),
+    )
+    strat = GeminiStrategy(settings)
+    # Level 1: yes_bid=0.49 (10), no_bid=0.49 (10 -> yes_ask=0.51).
+    # Deep level 2 ticks away has 100,000 contracts -> must NOT skew Level 1 imbalance!
+    snap = OrderbookSnapshot(
+        ticker="KXINXU-1",
+        timestamp_ms=1700000000000,
+        yes_bids=[
+            PriceLevel(price=Decimal("0.40"), count=Decimal("100000")),
+            PriceLevel(price=Decimal("0.49"), count=Decimal("10")),
+        ],
+        no_bids=[
+            PriceLevel(price=Decimal("0.40"), count=Decimal("50")),
+            PriceLevel(price=Decimal("0.49"), count=Decimal("10")),
+        ],
+    )
+    assert strat._compute_imbalance(snap) == Decimal("0")
+
+    portfolio = PortfolioState(
+        cash_balance_dollars=Decimal("100.00"),
+        starting_capital_dollars=Decimal("100.00"),
+        daily_start_equity_dollars=Decimal("100.00"),
+    )
+    prompt = strat._build_batch_prompt([snap], portfolio, {})
+    assert "100000" not in prompt
+    assert '"500"' in prompt
+
+    # BUY at 0.50 when best_yes_ask is 0.51 -> clamped up to 0.51 to cross spread
+    llm_out = json.dumps(
+        [
+            {
+                "ticker": "KXINXU-1",
+                "side": "bid",
+                "count": "2",
+                "limit_price": "0.5000",
+                "expected_edge_per_contract": "0.05",
+                "hold_to_expiry": True,
+                "confidence": "0.80",
+                "rationale": "Cross ask",
+            }
+        ]
+    )
+    with patch.object(strat, "_call_llm_batch", new=AsyncMock(return_value=(llm_out, 100, 20))):
+        res = await strat.evaluate_batch([snap], portfolio, force=True)
+    assert len(res.intents) == 1
+    assert res.intents[0].limit_price == Decimal("0.5100")

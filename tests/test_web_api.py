@@ -257,11 +257,11 @@ async def test_discover_active_markets_demo_fallback_by_volume() -> None:
     client = KalshiRestClient(base_url="https://external-api.demo.kalshi.co/trade-api/v2")
     with patch.object(client, "get_markets", get_mock):
         demo_selected = await client.discover_active_markets(
-            ["KXBTC"], max_tickers=6, environment="demo", now_utc=now
+            ["KXBTC"], max_tickers=6, environment="demo", now_utc=now, max_per_series=2
         )
-        assert get_mock.call_count == 1
-        assert get_mock.call_args.kwargs["mve_filter"] == "exclude"
-        assert get_mock.call_args.kwargs["limit"] == 200
+        assert get_mock.call_count >= 1
+        assert get_mock.call_args_list[0].kwargs["series_ticker"] == "KXBTC15M"
+        assert get_mock.call_args_list[0].kwargs["limit"] == 200
         prod_selected = await client.discover_active_markets(
             ["KXBTC"], max_tickers=6, environment="production", now_utc=now
         )
@@ -539,7 +539,8 @@ async def test_discover_active_markets_filters_atm_tight_spread_and_earliest_exp
         )
     await client.close()
 
-    assert [m.ticker for m in selected] == ["KXBTC15M-15M", "KXBTCD-2H"]
+    # Both share underlying BTC (max_per_series=1), and 15m expiry bucket ranks first
+    assert [m.ticker for m in selected] == ["KXBTC15M-15M"]
 
 
 async def test_ws_telemetry_hydrates_recent_history_on_connect(tmp_path: Path) -> None:
@@ -776,3 +777,288 @@ async def test_v2_order_endpoints_cancellation_and_fill_reconciliation(tmp_path:
     finally:
         await client.close()
         await telem.close()
+
+
+async def test_discover_active_markets_strict_two_sided_and_per_series_cap() -> None:
+    from datetime import datetime, timedelta, timezone
+    from kalshi_poc.client import KalshiRestClient
+    from kalshi_poc.models import MarketTicker
+
+    now = datetime(2026, 11, 17, 10, 0, 0, tzinfo=timezone.utc)
+    markets = [
+        # Zero-bid KXWTIH -> must be rejected
+        *[
+            MarketTicker(
+                ticker=f"KXWTIH-DEAD-{i}",
+                series_ticker="KXWTIH",
+                yes_bid_dollars=Decimal("0.00"),
+                no_bid_dollars=Decimal("0.22"),
+                volume_fp=Decimal("50000"),
+                close_time=now + timedelta(minutes=30),
+            )
+            for i in range(6)
+        ],
+        # 4 liquid KXBTC15M contracts -> capped at 2!
+        *[
+            MarketTicker(
+                ticker=f"KXBTC15M-{i}",
+                series_ticker="KXBTC15M",
+                yes_bid_dollars=Decimal("0.48"),
+                yes_ask_dollars=Decimal("0.51"),  # 3c spread
+                volume_fp=Decimal(str(1000 + i)),
+                close_time=now + timedelta(minutes=15),
+            )
+            for i in range(4)
+        ],
+        # 2 liquid KXETH15M contracts with tighter 2c spread -> ranked first!
+        MarketTicker(
+            ticker="KXETH15M-0",
+            series_ticker="KXETH15M",
+            yes_bid_dollars=Decimal("0.49"),
+            yes_ask_dollars=Decimal("0.51"),  # 2c spread
+            volume_fp=Decimal("500"),
+            close_time=now + timedelta(minutes=15),
+        ),
+        MarketTicker(
+            ticker="KXETH15M-1",
+            series_ticker="KXETH15M",
+            yes_bid_dollars=Decimal("0.49"),
+            yes_ask_dollars=Decimal("0.51"),  # 2c spread
+            volume_fp=Decimal("400"),
+            close_time=now + timedelta(minutes=15),
+        ),
+    ]
+
+    client = KalshiRestClient(base_url="https://external-api.demo.kalshi.co/trade-api/v2")
+    with patch.object(client, "get_markets", AsyncMock(return_value=markets)):
+        selected = await client.discover_active_markets(
+            ["KXBTC15M", "KXETH15M"], max_tickers=6, environment="production", now_utc=now
+        )
+    await client.close()
+
+    tickers = [m.ticker for m in selected]
+    assert not any(t.startswith("KXWTIH") for t in tickers)
+    assert set(tickers) == {"KXETH15M-0", "KXBTC15M-3"}
+
+
+async def test_discover_active_markets_deduplicates_underlying_assets() -> None:
+    from datetime import datetime, timedelta, timezone
+    from kalshi_poc.client import KalshiRestClient
+    from kalshi_poc.models import MarketTicker
+
+    now = datetime(2026, 11, 17, 10, 30, 0, tzinfo=timezone.utc)
+    markets = [
+        MarketTicker(
+            ticker="KXINX-1",
+            series_ticker="KXINX",
+            yes_bid_dollars=Decimal("0.49"),
+            yes_ask_dollars=Decimal("0.51"),
+            volume_fp=Decimal("1000"),
+            close_time=now + timedelta(hours=1),
+        ),
+        MarketTicker(
+            ticker="KXINXU-1",
+            series_ticker="KXINXU",
+            yes_bid_dollars=Decimal("0.49"),
+            yes_ask_dollars=Decimal("0.51"),
+            volume_fp=Decimal("900"),
+            close_time=now + timedelta(hours=1),
+        ),
+        MarketTicker(
+            ticker="KXINXU-2",
+            series_ticker="KXINXU",
+            yes_bid_dollars=Decimal("0.49"),
+            yes_ask_dollars=Decimal("0.51"),
+            volume_fp=Decimal("800"),
+            close_time=now + timedelta(hours=1),
+        ),
+        MarketTicker(
+            ticker="KXBTC15M-1",
+            series_ticker="KXBTC15M",
+            yes_bid_dollars=Decimal("0.48"),
+            yes_ask_dollars=Decimal("0.52"),
+            volume_fp=Decimal("500"),
+            close_time=now + timedelta(minutes=15),
+        ),
+    ]
+    client = KalshiRestClient(base_url="https://external-api.demo.kalshi.co/trade-api/v2")
+    with patch.object(client, "get_markets", AsyncMock(return_value=markets)):
+        selected = await client.discover_active_markets(
+            ["KXINX", "KXINXU", "KXBTC15M"],
+            max_tickers=6,
+            environment="production",
+            now_utc=now,
+            max_per_series=2,
+        )
+    await client.close()
+
+    tickers = [m.ticker for m in selected]
+    # KXINX + KXINXU share the "INX" cap of 2 -> KXBTC15M-1 is included!
+    assert sum(1 for t in tickers if t.startswith("KXINX")) == 2
+    assert "KXBTC15M-1" in tickers
+
+
+async def test_evict_widened_off_band_and_expiring_tickers(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+    from kalshi_poc.client import KalshiWebSocketClient
+    from kalshi_poc.main import TradingEngine
+    from kalshi_poc.models import OrderbookSnapshot, PriceLevel
+
+    cfg_mgr = ConfigManager(
+        env_path=tmp_path / ".env",
+        config_json_path=tmp_path / "config.json",
+        key_dir=tmp_path / "keys",
+    )
+    telem = TelemetryManager(tmp_path / "telem.db")
+    engine = TradingEngine(cfg_mgr, telem)
+    engine.ws_client = KalshiWebSocketClient(ws_url="wss://example.invalid")
+
+    now = datetime(2026, 11, 17, 13, 0, 0, tzinfo=timezone.utc)
+    # KXNASDAQDUD widened to $0.03 / $0.19 ($0.16 spread > $0.05)
+    bad_spread_snap = OrderbookSnapshot(
+        ticker="KXNASDAQDUD-WIDE",
+        timestamp_ms=int(now.timestamp() * 1000),
+        yes_bids=[PriceLevel(price=Decimal("0.03"), count=Decimal("10"))],
+        no_bids=[PriceLevel(price=Decimal("0.81"), count=Decimal("10"))],  # ask=0.19
+    )
+    # Healthy KXBTC15M ($0.48 / $0.51 -> $0.03 spread, mid 0.495)
+    good_snap = OrderbookSnapshot(
+        ticker="KXBTC15M-GOOD",
+        timestamp_ms=int(now.timestamp() * 1000),
+        yes_bids=[PriceLevel(price=Decimal("0.48"), count=Decimal("10"))],
+        no_bids=[PriceLevel(price=Decimal("0.49"), count=Decimal("10"))],
+    )
+    # Empty-book (Spread: --) after 10s grace period -> must be evicted!
+    empty_snap = OrderbookSnapshot(
+        ticker="KXSOL15M-EMPTY",
+        timestamp_ms=int(now.timestamp() * 1000),
+        yes_bids=[],
+        no_bids=[],
+    )
+    engine.ws_client.tickers = ["KXNASDAQDUD-WIDE", "KXBTC15M-GOOD", "KXSOL15M-EMPTY"]
+    engine.ws_client.set_snapshot(bad_spread_snap)
+    engine.ws_client.set_snapshot(good_snap)
+    engine.ws_client.set_snapshot(empty_snap)
+    engine._market_expiries["KXNASDAQDUD-WIDE"] = now + timedelta(minutes=30)
+    engine._market_expiries["KXBTC15M-GOOD"] = now + timedelta(minutes=15)
+    engine._market_expiries["KXSOL15M-EMPTY"] = now + timedelta(minutes=10)
+    # All subscribed 20s ago (past 10s grace period)
+    engine._subscribed_at = {
+        "KXNASDAQDUD-WIDE": 100.0,
+        "KXBTC15M-GOOD": 100.0,
+        "KXSOL15M-EMPTY": 100.0,
+    }
+
+    evicted = await engine._evict_unhealthy_subscriptions(cfg_mgr.settings, now, now_mono=120.0)
+    assert evicted == ["KXNASDAQDUD-WIDE", "KXSOL15M-EMPTY"]
+    assert engine.ws_client.tickers == ["KXBTC15M-GOOD"]
+    assert "KXSOL15M-EMPTY" not in engine.ws_client.orderbooks
+
+
+async def test_discovery_skips_under_125s_and_falls_back_to_hourly_crypto_and_nasdaqdud() -> None:
+    from datetime import datetime, timedelta, timezone
+    from kalshi_poc.client import KalshiRestClient
+    from kalshi_poc.models import MarketTicker
+
+    # 13:28:30 ET (during US market hours, 90s before 13:30:00 rollover)
+    now = datetime(2026, 11, 17, 18, 28, 30, tzinfo=timezone.utc)
+
+    async def fake_get_markets(series_ticker=None, status="open", limit=200, **kwargs):
+        assert limit == 200
+        if series_ticker == "KXBTC15M":
+            return [
+                MarketTicker(
+                    ticker="KXBTC15M-DYING-90S",
+                    series_ticker="KXBTC15M",
+                    yes_bid_dollars=Decimal("0.49"),
+                    yes_ask_dollars=Decimal("0.51"),
+                    close_time=now + timedelta(seconds=90),  # < 125s -> skipped!
+                )
+            ]
+        if series_ticker == "KXBTCD":
+            return [
+                # Deep ITM tail -> strictly rejected
+                MarketTicker(
+                    ticker="KXBTCD-TAIL-ITM",
+                    series_ticker="KXBTCD",
+                    yes_bid_dollars=Decimal("0.97"),
+                    yes_ask_dollars=Decimal("0.99"),
+                    close_time=now + timedelta(minutes=31),
+                ),
+                # Deep OTM tail -> strictly rejected
+                MarketTicker(
+                    ticker="KXBTCD-TAIL-OTM",
+                    series_ticker="KXBTCD",
+                    yes_bid_dollars=Decimal("0.00"),
+                    yes_ask_dollars=Decimal("0.01"),
+                    close_time=now + timedelta(minutes=31),
+                ),
+                # ATM hourly strike -> selected via fallback!
+                MarketTicker(
+                    ticker="KXBTCD-ATM-HOURLY",
+                    series_ticker="KXBTCD",
+                    yes_bid_dollars=Decimal("0.49"),
+                    yes_ask_dollars=Decimal("0.52"),
+                    close_time=now + timedelta(minutes=31),
+                ),
+            ]
+        if series_ticker == "KXSOL15M":
+            return [
+                MarketTicker(
+                    ticker="KXSOL15M-OK-130S",
+                    series_ticker="KXSOL15M",
+                    yes_bid_dollars=Decimal("0.48"),
+                    yes_ask_dollars=Decimal("0.52"),
+                    close_time=now + timedelta(seconds=130),  # >= 125s -> eligible!
+                ),
+            ]
+        if series_ticker == "KXINXU":
+            # Only extreme tails -> must select NONE (no blind fallback!)
+            return [
+                MarketTicker(
+                    ticker="KXINXU-TAIL-HIGH",
+                    series_ticker="KXINXU",
+                    yes_bid_dollars=Decimal("0.97"),
+                    yes_ask_dollars=Decimal("0.99"),
+                    close_time=now + timedelta(hours=1),
+                ),
+                MarketTicker(
+                    ticker="KXINXU-TAIL-LOW",
+                    series_ticker="KXINXU",
+                    yes_bid_dollars=Decimal("0.00"),
+                    yes_ask_dollars=Decimal("0.01"),
+                    close_time=now + timedelta(hours=1),
+                ),
+            ]
+        if series_ticker == "KXNASDAQ100U":
+            return []
+        if series_ticker == "KXNASDAQDUD":
+            return [
+                MarketTicker(
+                    ticker="KXNASDAQDUD-ACTIVE",
+                    series_ticker="KXNASDAQDUD",
+                    yes_bid_dollars=Decimal("0.47"),
+                    yes_ask_dollars=Decimal("0.50"),
+                    close_time=now + timedelta(hours=2),
+                )
+            ]
+        return []
+
+    client = KalshiRestClient(base_url="https://external-api.demo.kalshi.co/trade-api/v2")
+    with (
+        patch.object(client, "get_markets", side_effect=fake_get_markets),
+        patch("kalshi_poc.client.asyncio.sleep", AsyncMock(return_value=None)),
+    ):
+        selected = await client.discover_active_markets(
+            ["KXBTC15M", "KXSOL15M", "KXINXU", "KXNASDAQ100U"],
+            max_tickers=6,
+            environment="production",
+            now_utc=now,
+        )
+    await client.close()
+
+    assert [m.ticker for m in selected] == [
+        "KXBTCD-ATM-HOURLY",
+        "KXSOL15M-OK-130S",
+        "KXNASDAQDUD-ACTIVE",
+    ]

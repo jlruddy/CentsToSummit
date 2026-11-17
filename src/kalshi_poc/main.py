@@ -73,7 +73,10 @@ class TradingEngine:
         self._task: asyncio.Task[None] | None = None
         self._last_mode_before_pause = ExecutionMode.SHADOW
         self._market_expiries: dict[str, datetime] = {}
+        self._subscribed_at: dict[str, float] = {}
         self._last_discovery_monotonic: float = 0.0
+        self._last_eviction_check_monotonic: float = 0.0
+        self._last_hold_broadcast_monotonic: float = 0.0
         self._funded_shards: set[int] = set()
         self._engine_lock = asyncio.Lock()
         self.session_start_ts: int = int(time.time() * 1000)
@@ -164,7 +167,13 @@ class TradingEngine:
             if not self.portfolio.positions and not self.portfolio.recent_order_timestamps_ms:
                 self.portfolio.starting_capital_dollars = bal.balance_dollars
                 self.portfolio.daily_start_equity_dollars = bal.balance_dollars
-            logger.info("Synced Kalshi balance: $%s", bal.balance_dollars)
+            logger.info(
+                "Synced Kalshi balance: $%s (portfolio_value=$%s, shards=%s)",
+                bal.balance_dollars,
+                bal.portfolio_value_dollars,
+                bal.balance_breakdown or {},
+            )
+            await self.rest_client.log_open_positions_and_resting_orders()
             await self._broadcast_equity_and_status()
         except Exception as exc:
             logger.warning("Balance sync failed: %s", exc)
@@ -172,10 +181,18 @@ class TradingEngine:
     async def _refresh_subscriptions(self, s: AppSettings) -> None:
         if self.ws_client is None:
             return
-        tickers = await self._discover_tickers(s)
-        if tickers:
-            await self._seed_orderbooks(tickers)
-            await self.ws_client.update_subscriptions(tickers)
+        discovered = await self._discover_tickers(s)
+        merged = list(self.ws_client.tickers)
+        for t in discovered:
+            if t not in merged and len(merged) < 6:
+                merged.append(t)
+        now_mono = time.monotonic()
+        for t in merged:
+            if t not in self._subscribed_at:
+                self._subscribed_at[t] = now_mono
+        if merged:
+            await self._seed_orderbooks(merged)
+            await self.ws_client.update_subscriptions(merged)
 
     async def _restart_ws(self, s: AppSettings) -> None:
         if self.ws_client is not None:
@@ -205,6 +222,9 @@ class TradingEngine:
 
         tickers = await self._discover_tickers(s)
         logger.info("Subscribing to Kalshi WS tickers: %s", tickers)
+        now_mono = time.monotonic()
+        for t in tickers:
+            self._subscribed_at[t] = now_mono
         await self._seed_orderbooks(tickers)
         self.ws_client.start(tickers)
 
@@ -333,17 +353,87 @@ class TradingEngine:
             if self.rest_client is not None:
                 await self.rest_client.upgrade_api_tier_once()
 
+    async def _evict_unhealthy_subscriptions(
+        self, s: AppSettings, now_utc: datetime, now_mono: float | None = None
+    ) -> list[str]:
+        """Evict tickers if <120s left, empty book (bid/ask is None), wide spread, or mid off-band."""
+        if self.ws_client is None or s.subscribed_tickers:
+            return []
+        mono = now_mono if now_mono is not None else time.monotonic()
+        evicted: list[str] = []
+        all_tracked = list(
+            dict.fromkeys(list(self.ws_client.tickers) + list(self.ws_client.orderbooks.keys()))
+        )
+        for ticker in all_tracked:
+            exp = self._market_expiries.get(ticker)
+            close_in = (exp - now_utc).total_seconds() if exp is not None else None
+            snap = self.ws_client.orderbooks.get(ticker)
+            bid = snap.best_yes_bid if snap is not None else None
+            ask = snap.best_yes_ask if snap is not None else None
+
+            sub_ts = self._subscribed_at.get(ticker, 0.0)
+            in_grace = (mono - sub_ts) < 10.0
+
+            reason: str | None = None
+            if close_in is not None and close_in < 120.0:
+                reason = "expired"
+            elif not in_grace:
+                if snap is None or bid is None or ask is None:
+                    reason = "empty_book"
+                elif snap.yes_spread is not None and snap.yes_spread > Decimal("0.08"):
+                    reason = "wide_spread"
+                elif snap.mid_yes_price is not None and (
+                    snap.mid_yes_price < Decimal("0.15")
+                    or snap.mid_yes_price > Decimal("0.85")
+                ):
+                    reason = "off_mid"
+
+            if reason is not None:
+                evicted.append(ticker)
+                logger.info(
+                    "[EVICT] ticker=%s reason=%s (bid=%s, ask=%s, close_in=%ss)",
+                    ticker,
+                    reason,
+                    bid,
+                    ask,
+                    f"{close_in:.0f}" if close_in is not None else "unknown",
+                )
+
+        if evicted:
+            await self.ws_client.unsubscribe_tickers(evicted)
+            for t in evicted:
+                self._subscribed_at.pop(t, None)
+                if t not in self.portfolio.positions:
+                    self._market_expiries.pop(t, None)
+        return evicted
+
     async def _engine_loop(self) -> None:
         while self._running:
             s = self.config_manager.settings
             try:
-                # Roll forward if any subscribed hourly contract has expired (throttled to >= 45s)
                 now_utc = datetime.now(timezone.utc)
-                discovery_due = (time.monotonic() - self._last_discovery_monotonic) >= 45.0
-                if self.ws_client is not None and discovery_due and (
-                    not self.ws_client.tickers
-                    or any(
-                        exp <= now_utc for exp in self._market_expiries.values()
+                now_mono = time.monotonic()
+
+                # Every 30s, evict unhealthy tickers and refill missing slots up to 6
+                evicted: list[str] = []
+                maintenance_due = (now_mono - self._last_eviction_check_monotonic) >= 30.0
+                if maintenance_due:
+                    self._last_eviction_check_monotonic = now_mono
+                    evicted = await self._evict_unhealthy_subscriptions(s, now_utc, now_mono)
+
+                discovery_cooldown_ok = (now_mono - self._last_discovery_monotonic) >= 15.0
+                if (
+                    self.ws_client is not None
+                    and discovery_cooldown_ok
+                    and (
+                        evicted
+                        or (
+                            maintenance_due
+                            and (
+                                len(self.ws_client.tickers) < 6
+                                or any(exp <= now_utc for exp in self._market_expiries.values())
+                            )
+                        )
                     )
                 ):
                     await self._refresh_subscriptions(s)
@@ -369,9 +459,26 @@ class TradingEngine:
                         and not self.portfolio.kill_switch_tripped
                         and self.ws_client is not None
                     ):
-                        snapshots = list(self.ws_client.orderbooks.values())
-                        if snapshots:
-                            await self._process_batch(snapshots, s, execute_orders=True)
+                        active_snapshots: list[OrderbookSnapshot] = []
+                        stale_tickers: list[str] = []
+                        for snap in list(self.ws_client.orderbooks.values()):
+                            exp = self._market_expiries.get(snap.ticker)
+                            if exp is not None and (exp - now_utc).total_seconds() < 120.0:
+                                stale_tickers.append(snap.ticker)
+                                continue
+                            if snap.best_yes_bid is None or snap.best_yes_ask is None:
+                                continue
+                            active_snapshots.append(snap)
+                        if stale_tickers:
+                            await self.ws_client.unsubscribe_tickers(stale_tickers)
+                            for t in stale_tickers:
+                                self._subscribed_at.pop(t, None)
+                                if t not in self.portfolio.positions:
+                                    self._market_expiries.pop(t, None)
+                        if active_snapshots:
+                            await self._process_batch(
+                                active_snapshots[:8], s, execute_orders=True
+                            )
 
                     ts_ms = int(time.time() * 1000)
                     eq_point = {
@@ -420,15 +527,27 @@ class TradingEngine:
             positions_by_ticker=self.portfolio.positions,
             force=force,
         )
-        for decision in batch.decisions:
-            await self.telemetry.log_ai_decision(decision)
+        is_gated_hold = not batch.invoked_llm and not batch.intents and not force
+        if is_gated_hold:
+            now_mono = time.monotonic()
+            if (now_mono - self._last_hold_broadcast_monotonic) >= 30.0:
+                self._last_hold_broadcast_monotonic = now_mono
+                for decision in batch.decisions:
+                    await self.telemetry.log_ai_decision(decision)
+        else:
+            for decision in batch.decisions:
+                await self.telemetry.log_ai_decision(decision)
 
         snap_map = {snap.ticker: snap for snap in snapshots}
         for intent in batch.intents:
-            snap = snap_map.get(intent.ticker)
-            if snap is not None:
+            live_snap = (
+                self.ws_client.orderbooks.get(intent.ticker)
+                if self.ws_client is not None
+                else None
+            ) or snap_map.get(intent.ticker)
+            if live_snap is not None:
                 await self._evaluate_and_execute_intent(
-                    intent, snap, s, execute_orders=execute_orders
+                    intent, live_snap, s, execute_orders=execute_orders
                 )
 
     async def _process_snapshot(
@@ -443,6 +562,27 @@ class TradingEngine:
         s: AppSettings,
         execute_orders: bool = True,
     ) -> None:
+        max_slip_dollars = (s.max_slippage_cents / Decimal("100")).quantize(Decimal("0.0001"))
+        if snap.best_yes_bid is not None and snap.best_yes_ask is not None:
+            if intent.side == OrderSide.BID:
+                inside_ask = snap.best_yes_ask
+                if (inside_ask - intent.limit_price) <= max_slip_dollars:
+                    clamped_px = min(
+                        max(intent.limit_price, inside_ask),
+                        inside_ask + Decimal("0.01"),
+                    )
+                    if clamped_px != intent.limit_price:
+                        intent = intent.model_copy(update={"limit_price": clamped_px})
+            else:
+                inside_bid = snap.best_yes_bid
+                if (intent.limit_price - inside_bid) <= max_slip_dollars:
+                    clamped_px = max(
+                        min(intent.limit_price, inside_bid),
+                        inside_bid - Decimal("0.01"),
+                    )
+                    if clamped_px != intent.limit_price:
+                        intent = intent.model_copy(update={"limit_price": clamped_px})
+
         evaluation = self.risk_gate.evaluate(intent, snap, self.portfolio)
         await self.telemetry.log_risk_evaluation(evaluation)
 

@@ -111,16 +111,36 @@ class RiskGate:
                 f"Market position limit exceeded (${existing_notional + proposed_notional:.2f} > ${s.max_position_dollars_per_market:.2f})"
             )
 
-        # 4. Orderbook depth, slippage, and fee-edge filter
+        # 4. Orderbook depth, price-band [0.15, 0.85], slippage, and fee-edge filter
         est_fill_price = intent.limit_price
         est_slippage = Decimal("0.00")
         entry_fee = calculate_taker_fee(intent.count, intent.limit_price)
         round_trip_fee = entry_fee * Decimal("2")
+        max_slip_dollars = (s.max_slippage_cents / Decimal("100")).quantize(Decimal("0.0001"))
 
         if snapshot is None:
             reasons.append(f"No live orderbook snapshot available for {intent.ticker}")
+        elif snapshot.best_yes_bid is None or snapshot.best_yes_ask is None:
+            reasons.append(
+                f"Orderbook for {intent.ticker} is one-sided or empty (bid={snapshot.best_yes_bid}, ask={snapshot.best_yes_ask})"
+            )
         else:
-            walk = walk_book(snapshot, intent.side, intent.count, limit_price=None)
+            if intent.side == OrderSide.BID and (
+                snapshot.best_yes_ask - intent.limit_price
+            ) > max_slip_dollars:
+                reasons.append(
+                    f"Live inside ask (${snapshot.best_yes_ask:.4f}) moved > max slippage (${max_slip_dollars:.2f}) past reference (${intent.limit_price:.4f})"
+                )
+            elif intent.side == OrderSide.ASK and (
+                intent.limit_price - snapshot.best_yes_bid
+            ) > max_slip_dollars:
+                reasons.append(
+                    f"Live inside bid (${snapshot.best_yes_bid:.4f}) moved > max slippage (${max_slip_dollars:.2f}) past reference (${intent.limit_price:.4f})"
+                )
+
+            walk = walk_book(
+                snapshot, intent.side, intent.count, limit_price=intent.limit_price
+            )
             if not walk.fully_fillable:
                 reasons.append(
                     f"Insufficient book depth (requested {intent.count}, available {walk.fillable_count})"
@@ -177,6 +197,23 @@ class RiskGate:
                     reasons.append(
                         f"Net edge (${net_edge:.4f}) below minimum (${min_required_net:.2f})"
                     )
+
+        # Enforce 0.15 <= effective_price <= 0.85 on both YES and NO sides
+        effective_fill_price = (
+            est_fill_price if intent.side == OrderSide.BID else (ONE - est_fill_price)
+        )
+        effective_limit_price = (
+            intent.limit_price if intent.side == OrderSide.BID else (ONE - intent.limit_price)
+        )
+        if not (
+            Decimal("0.15") <= est_fill_price <= Decimal("0.85")
+            and Decimal("0.15") <= (ONE - est_fill_price) <= Decimal("0.85")
+            and Decimal("0.15") <= intent.limit_price <= Decimal("0.85")
+            and Decimal("0.15") <= (ONE - intent.limit_price) <= Decimal("0.85")
+        ):
+            reasons.append(
+                f"Effective price ${effective_fill_price:.4f} (YES ${est_fill_price:.4f}, limit ${effective_limit_price:.4f}) outside allowed [$0.15, $0.85] band"
+            )
 
         # 5. Hard Equity Floor (EQUITY_FLOOR)
         proposed_collateral = proposed_notional + entry_fee

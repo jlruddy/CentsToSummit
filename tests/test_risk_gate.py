@@ -184,3 +184,52 @@ def test_risk_gate_approves_intraday_hold_to_expiry_multi_contract_edge() -> Non
     assert eval_res.approved is True
     assert eval_res.estimated_entry_fee_dollars == Decimal("0.07")
     assert eval_res.estimated_round_trip_fee_dollars == Decimal("0.14")
+
+
+def test_risk_gate_rejects_outside_015_085_price_band_and_chasing_ask() -> None:
+    settings = AppSettings(
+        _env_file=None,
+        allowed_series_prefixes=["KXETH15M", "KXBTC"],
+        max_slippage_cents=Decimal("2"),
+    )
+    gate = RiskGate(settings)
+
+    # 1. $0.91 favorite (> $0.85) must be rejected on price band
+    high_snap = OrderbookSnapshot(
+        ticker="KXETH15M-26NOV171330-30",
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal("0.90"), count=Decimal("50"))],
+        no_bids=[PriceLevel(price=Decimal("0.09"), count=Decimal("50"))],  # YES ask = 0.91
+    )
+    high_intent = _make_intent(
+        ticker="KXETH15M-26NOV171330-30",
+        side=OrderSide.BID,
+        count=Decimal("2"),
+        limit_price=Decimal("0.91"),
+        expected_edge_dollars=Decimal("0.16"),
+        expected_edge_per_contract=Decimal("0.08"),
+        hold_to_expiry=True,
+    )
+    res_high = gate.evaluate(high_intent, high_snap, _make_portfolio())
+    assert res_high.approved is False
+    assert any("outside allowed [$0.15, $0.85] band" in r for r in res_high.rejection_reasons)
+
+    # 2. Live inside ask ($0.55) moved > max_slippage ($0.02) past reference ($0.50) -> rejected
+    moved_snap = OrderbookSnapshot(
+        ticker="KXETH15M-26NOV171330-30",
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal("0.53"), count=Decimal("50"))],
+        no_bids=[PriceLevel(price=Decimal("0.45"), count=Decimal("50"))],  # YES ask = 0.55
+    )
+    stale_intent = _make_intent(
+        ticker="KXETH15M-26NOV171330-30",
+        side=OrderSide.BID,
+        count=Decimal("2"),
+        limit_price=Decimal("0.50"),
+        expected_edge_dollars=Decimal("0.16"),
+        expected_edge_per_contract=Decimal("0.08"),
+        hold_to_expiry=True,
+    )
+    res_moved = gate.evaluate(stale_intent, moved_snap, _make_portfolio())
+    assert res_moved.approved is False
+    assert any("moved > max slippage" in r for r in res_moved.rejection_reasons)
