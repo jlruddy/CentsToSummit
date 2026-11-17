@@ -51,6 +51,8 @@ class KalshiRestClient:
         self._last_balance_call_monotonic: float = 0.0
         self.market_shards: dict[str, int] = {}
         self.shard_balances: dict[int, Decimal] = {}
+        self.market_expiries: dict[str, datetime] = {}
+        self.market_statuses: dict[str, str] = {}
         self._last_markets_cursor: str | None = None
         self._tier_upgraded: bool = False
 
@@ -152,7 +154,47 @@ class KalshiRestClient:
         for m in markets:
             if m.exchange_index is not None:
                 self.market_shards[m.ticker] = m.exchange_index
+            if m.expiry_dt is not None:
+                self.market_expiries[m.ticker] = (
+                    m.expiry_dt
+                    if m.expiry_dt.tzinfo is not None
+                    else m.expiry_dt.replace(tzinfo=timezone.utc)
+                )
+            if m.status:
+                self.market_statuses[m.ticker] = m.status.lower()
         return markets
+
+    async def is_market_open_and_unexpired(
+        self, ticker: str, now_utc: datetime | None = None
+    ) -> tuple[bool, datetime | None]:
+        """Check if `ticker` is open and has `close_time > now_utc` (fetching GET /markets/{ticker} if uncached)."""
+        now = now_utc or datetime.now(timezone.utc)
+        exp = self.market_expiries.get(ticker)
+        status = self.market_statuses.get(ticker)
+        if exp is None or status is None:
+            try:
+                data, _ = await self._request("GET", f"/markets/{ticker}", private=False)
+                mkt_raw = data.get("market", data)
+                mkt = MarketTicker.model_validate(mkt_raw)
+                if mkt.exchange_index is not None:
+                    self.market_shards[ticker] = mkt.exchange_index
+                if mkt.expiry_dt is not None:
+                    exp = (
+                        mkt.expiry_dt
+                        if mkt.expiry_dt.tzinfo is not None
+                        else mkt.expiry_dt.replace(tzinfo=timezone.utc)
+                    )
+                    self.market_expiries[ticker] = exp
+                status = (mkt.status or "open").lower()
+                self.market_statuses[ticker] = status
+            except Exception as exc:
+                logger.debug("Failed to fetch market metadata for %s: %s", ticker, exc)
+
+        if status is not None and status not in ("open", "active"):
+            return False, exp
+        if exp is not None and exp <= now:
+            return False, exp
+        return True, exp
 
     async def get_market_exchange_index(self, ticker: str) -> int:
         """Return cached exchange_index for ticker, or fetch GET /markets/{ticker} if unknown."""
@@ -282,6 +324,8 @@ class KalshiRestClient:
                 return Decimal("1.00")
             return max(Decimal("0"), ask - bid)
 
+        max_close_ts = int(now.timestamp()) + 86400
+
         async def _fetch_series(series: str) -> list[MarketTicker]:
             for attempt in range(2):
                 try:
@@ -289,6 +333,7 @@ class KalshiRestClient:
                         series_ticker=series,
                         status="open",
                         limit=200,
+                        max_close_ts=max_close_ts,
                     )
                 except KalshiApiError as exc:
                     if exc.status_code == 429 and attempt == 0:
@@ -301,7 +346,9 @@ class KalshiRestClient:
                     return []
             return []
 
-        def _pick_for_series(series: str, mkts: list[MarketTicker]) -> list[MarketTicker]:
+        def _pick_for_series(
+            series: str, mkts: list[MarketTicker], cap: int = max_per_series
+        ) -> list[MarketTicker]:
             s_up = series.upper()
             series_mkts = [
                 m
@@ -352,7 +399,7 @@ class KalshiRestClient:
                 ask,
                 _score_contract(chosen),
             )
-            return qualified[:max_per_series]
+            return qualified[:cap]
 
         selected: list[MarketTicker] = []
         seen_tickers: set[str] = set()
@@ -362,20 +409,20 @@ class KalshiRestClient:
             if idx > 0:
                 await asyncio.sleep(0.20)
             mkts = await _fetch_series(series)
-            picks = _pick_for_series(series, mkts)
+            picks = _pick_for_series(series, mkts, cap=max_per_series)
 
             # Fallback to hourly multi-strike crypto series during 2-minute 15M rollover windows
             if not picks and series in crypto_hourly_fallback:
                 fb_series = crypto_hourly_fallback[series]
                 await asyncio.sleep(0.20)
                 fb_mkts = await _fetch_series(fb_series)
-                picks = _pick_for_series(fb_series, fb_mkts)
+                picks = _pick_for_series(fb_series, fb_mkts, cap=max_per_series)
 
             # Fallback to KXNASDAQDUD if KXNASDAQ100U has no qualifying active contracts
             if not picks and series == "KXNASDAQ100U":
                 await asyncio.sleep(0.20)
                 dud_mkts = await _fetch_series("KXNASDAQDUD")
-                picks = _pick_for_series("KXNASDAQDUD", dud_mkts)
+                picks = _pick_for_series("KXNASDAQDUD", dud_mkts, cap=max_per_series)
 
             for chosen in picks:
                 if chosen.ticker not in seen_tickers:
@@ -388,6 +435,28 @@ class KalshiRestClient:
                             break
             if len(selected) >= max_tickers:
                 break
+
+        # If < max_tickers distinct underlyings had qualifying books (e.g. NASDAQ empty),
+        # fill remaining slots with distinct hourly series_tickers (1 ticker per series_ticker).
+        if len(query_series) >= 6 and 0 < len(selected) < max_tickers:
+            seen_exact_series = {
+                (m.series_ticker or m.ticker.split("-", 1)[0]).upper() for m in selected
+            }
+            for extra_series in ("KXBTCD", "KXETHD", "KXSOLD", "KXXRPD"):
+                if len(selected) >= max_tickers:
+                    break
+                if extra_series in seen_exact_series:
+                    continue
+                await asyncio.sleep(0.20)
+                extra_mkts = await _fetch_series(extra_series)
+                extra_picks = _pick_for_series(extra_series, extra_mkts, cap=1)
+                for chosen in extra_picks:
+                    exact_s = (chosen.series_ticker or chosen.ticker.split("-", 1)[0]).upper()
+                    if chosen.ticker not in seen_tickers and exact_s not in seen_exact_series:
+                        seen_exact_series.add(exact_s)
+                        seen_tickers.add(chosen.ticker)
+                        selected.append(chosen)
+                        break
 
         # Demo sandbox fallback if per-series queries returned nothing
         if not selected and environment == "demo":

@@ -120,8 +120,17 @@ class BalanceResponse(BaseModel):
                 except (ValueError, TypeError):
                     continue
 
+        bal_dec = _to_decimal(bal) if bal is not None else Decimal("0.00")
+        bd_sum = sum(breakdown.values(), Decimal("0.00"))
+        if (
+            breakdown
+            and bal_dec > Decimal("0")
+            and abs(bd_sum * Decimal("100") - bal_dec) <= Decimal("0.05")
+        ):
+            breakdown = {k: (v * Decimal("100")).quantize(Decimal("0.0001")) for k, v in breakdown.items()}
+
         return cls(
-            balance_dollars=bal if bal is not None else Decimal("0.00"),
+            balance_dollars=bal_dec,
             portfolio_value_dollars=pv if pv is not None else Decimal("0.00"),
             updated_ts=data.get("updated_ts"),
             balance_breakdown=breakdown,
@@ -443,13 +452,20 @@ class PortfolioState(BaseModel):
     daily_start_equity_dollars: Decimal
     positions: dict[str, Position] = Field(default_factory=dict)
     resting_order_collateral_dollars: Decimal = Field(default=Decimal("0.00"))
+    resting_order_tickers: set[str] = Field(default_factory=set)
     recent_order_timestamps_ms: list[int] = Field(default_factory=list)
     kill_switch_tripped: bool = False
 
     @property
     def total_position_value_dollars(self) -> Decimal:
         return sum(
-            (abs(p.net_contracts) * p.avg_entry_price for p in self.positions.values()),
+            (
+                p.cost_basis_dollars
+                if p.cost_basis_dollars > Decimal("0")
+                else abs(p.net_contracts) * p.avg_entry_price
+                for p in self.positions.values()
+                if p.net_contracts != Decimal("0")
+            ),
             Decimal("0.00"),
         )
 

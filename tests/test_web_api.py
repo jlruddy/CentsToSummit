@@ -1062,3 +1062,184 @@ async def test_discovery_skips_under_125s_and_falls_back_to_hourly_crypto_and_na
         "KXSOL15M-OK-130S",
         "KXNASDAQDUD-ACTIVE",
     ]
+
+
+async def test_portfolio_sync_drops_expired_positions_reaps_resting_orders_and_signed_slippage(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+    from kalshi_poc.client import KalshiRestClient, KalshiWebSocketClient
+    from kalshi_poc.main import TradingEngine
+    from kalshi_poc.models import (
+        BalanceResponse,
+        OrderSide,
+        OrderbookSnapshot,
+        PriceLevel,
+        TradeIntent,
+    )
+
+    cfg_mgr = ConfigManager(
+        env_path=tmp_path / ".env",
+        config_json_path=tmp_path / "config.json",
+        key_dir=tmp_path / "keys",
+    )
+    cfg_mgr.update_and_persist(
+        {
+            "kalshi_environment": "production",
+            "execution_mode": "live",
+            "initial_capital": "25.00",
+            "equity_floor": "15.00",
+            "max_open_markets": 5,
+        }
+    )
+    telem = TelemetryManager(tmp_path / "telem.db")
+    await telem.initialize()
+    client = KalshiRestClient(
+        base_url="https://external-api.kalshi.com/trade-api/v2",
+        signer=AsyncMock(),
+    )
+    try:
+        engine = TradingEngine(cfg_mgr, telem)
+        engine.rest_client = client
+        engine.ws_client = KalshiWebSocketClient(ws_url="wss://example.invalid")
+        now_utc = datetime.now(timezone.utc)
+
+        # 1. Expired position is excluded; active position is retained
+        engine._market_expiries["KXBTC15M-EXPIRED"] = now_utc - timedelta(minutes=5)
+        engine._market_expiries["KXBTCD-ACTIVE"] = now_utc + timedelta(minutes=30)
+
+        with (
+            patch.object(
+                client,
+                "get_balance",
+                AsyncMock(
+                    return_value=(
+                        BalanceResponse(
+                            balance_dollars=Decimal("31.33"),
+                            portfolio_value_dollars=Decimal("2.24"),
+                        ),
+                        5.0,
+                    )
+                ),
+            ),
+            patch.object(
+                client,
+                "get_open_positions",
+                AsyncMock(
+                    return_value=[
+                        {
+                            "ticker": "KXBTC15M-EXPIRED",
+                            "position_fp": "4.00",
+                            "market_exposure_dollars": "1.92",
+                        },
+                        {
+                            "ticker": "KXBTCD-ACTIVE",
+                            "position_fp": "7.00",
+                            "market_exposure_dollars": "2.24",
+                        },
+                    ]
+                ),
+            ),
+            patch.object(
+                client,
+                "is_market_open_and_unexpired",
+                AsyncMock(return_value=(True, now_utc + timedelta(minutes=30))),
+            ),
+            patch.object(
+                client,
+                "get_resting_orders",
+                AsyncMock(
+                    return_value=[
+                        {
+                            "order_id": "stale-ord-1",
+                            "ticker": "KXETHD-STALE",
+                            "remaining_count_fp": "2",
+                            "price_dollars": "0.45",
+                            "created_time": (now_utc - timedelta(seconds=35)).isoformat(),
+                        }
+                    ]
+                ),
+            ),
+            patch.object(client, "cancel_order", AsyncMock(return_value={})) as cancel_mock,
+        ):
+            await engine.sync_balance_from_api()
+
+        assert "KXBTC15M-EXPIRED" not in engine.portfolio.positions
+        assert "KXBTCD-ACTIVE" in engine.portfolio.positions
+        assert engine.portfolio.cash_balance_dollars == Decimal("31.33")
+        cancel_mock.assert_awaited_once_with("stale-ord-1", market_ticker="KXETHD-STALE")
+
+        # 2. Stacking entry on KXBTCD-ACTIVE is blocked by RiskGate
+        snap_active = OrderbookSnapshot(
+            ticker="KXBTCD-ACTIVE",
+            timestamp_ms=1700000000000,
+            yes_bids=[PriceLevel(price=Decimal("0.48"), count=Decimal("50"))],
+            no_bids=[PriceLevel(price=Decimal("0.50"), count=Decimal("50"))],
+        )
+        stack_intent = TradeIntent(
+            timestamp_ms=1700000000000,
+            ticker="KXBTCD-ACTIVE",
+            side=OrderSide.BID,
+            count=Decimal("2"),
+            limit_price=Decimal("0.50"),
+            expected_edge_dollars=Decimal("0.16"),
+            expected_edge_per_contract=Decimal("0.08"),
+            hold_to_expiry=True,
+            confidence=Decimal("0.80"),
+            inference_latency_ms=5,
+            rationale="Stack test",
+            provider="gemini",
+        )
+        eval_stack = engine.risk_gate.evaluate(stack_intent, snap_active, engine.portfolio)
+        assert eval_stack.approved is False
+        assert any("stacking entries blocked" in r for r in eval_stack.rejection_reasons)
+
+        # 3. Favorable fill ($0.67 actual vs $0.74 expected) records $0.0000 adverse slippage
+        snap_new = OrderbookSnapshot(
+            ticker="KXETHD-NEW",
+            timestamp_ms=1700000000000,
+            yes_bids=[PriceLevel(price=Decimal("0.72"), count=Decimal("50"))],
+            no_bids=[PriceLevel(price=Decimal("0.26"), count=Decimal("50"))],  # ask = 0.74
+        )
+        new_intent = TradeIntent(
+            timestamp_ms=1700000000000,
+            ticker="KXETHD-NEW",
+            side=OrderSide.BID,
+            count=Decimal("2"),
+            limit_price=Decimal("0.74"),
+            expected_edge_dollars=Decimal("0.16"),
+            expected_edge_per_contract=Decimal("0.08"),
+            hold_to_expiry=True,
+            confidence=Decimal("0.80"),
+            inference_latency_ms=5,
+            rationale="Price improvement test",
+            provider="gemini",
+        )
+        q = telem.subscribe()
+        with (
+            patch.object(
+                client,
+                "create_order",
+                AsyncMock(
+                    return_value={
+                        "order_id": "ord-fav-1",
+                        "fill_count": "2",
+                        "remaining_count": "0",
+                        "average_fill_price": "0.6700",
+                        "average_fee_paid": "0.04",
+                    }
+                ),
+            ),
+            patch.object(client, "upgrade_api_tier_once", AsyncMock(return_value=None)),
+        ):
+            await engine._evaluate_and_execute_intent(new_intent, snap_new, cfg_mgr.settings)
+
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        exec_ev = [e for e in events if e["type"] == "EXECUTION"][-1]
+        assert exec_ev["data"]["fill_price"] == "0.6700"
+        assert exec_ev["data"]["slippage_dollars"] == "0.0000"
+    finally:
+        await client.close()
+        await telem.close()

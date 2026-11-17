@@ -92,13 +92,35 @@ class RiskGate:
 
         active_tickers = {
             k for k, pos in portfolio.positions.items() if pos.net_contracts != Decimal("0")
-        }
+        } | set(portfolio.resting_order_tickers)
         if intent.ticker not in active_tickers and len(active_tickers) >= s.max_open_markets:
             reasons.append(
                 f"Max open markets reached ({len(active_tickers)}/{s.max_open_markets})"
             )
 
         existing_pos = portfolio.positions.get(intent.ticker)
+        is_reducing_exit = (
+            existing_pos is not None
+            and existing_pos.net_contracts != Decimal("0")
+            and not intent.hold_to_expiry
+            and (
+                (existing_pos.net_contracts > Decimal("0") and intent.side == OrderSide.ASK)
+                or (existing_pos.net_contracts < Decimal("0") and intent.side == OrderSide.BID)
+            )
+        )
+        if intent.ticker in portfolio.resting_order_tickers:
+            reasons.append(
+                f"Active resting order already exists on {intent.ticker} (1 order per ticker limit)"
+            )
+        elif (
+            existing_pos is not None
+            and existing_pos.net_contracts != Decimal("0")
+            and not is_reducing_exit
+        ):
+            reasons.append(
+                f"Active position already held on {intent.ticker} ({existing_pos.net_contracts} contracts); stacking entries blocked"
+            )
+
         existing_notional = (
             existing_pos.cost_basis_dollars if existing_pos else Decimal("0.00")
         )

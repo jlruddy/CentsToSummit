@@ -387,7 +387,20 @@ class StubMomentumStrategy(BaseStrategy):
                         detail["imbalance"] = f"{imbalance:.2f}"
                         return intent, detail
 
-        # 2. Liquidity- & Budget-Aware Entry Logic
+        # 2. Liquidity- & Budget-Aware Entry Logic (1 position/order per ticker)
+        if snapshot.ticker in portfolio.resting_order_tickers or (
+            pos is not None and pos.net_contracts != Decimal("0")
+        ):
+            return None, self._hold_detail(
+                ts_ms=ts_ms,
+                ticker=snapshot.ticker,
+                mid=mid,
+                imbalance=imbalance,
+                confidence=abs(imbalance),
+                latency_ms=latency_ms,
+                rationale="StubMomentum: HOLD (position or resting order already active on ticker)",
+            )
+
         deployable_budget = max(
             Decimal("0.00"),
             portfolio.current_equity_dollars
@@ -622,8 +635,10 @@ class _LLMStrategyBase(BaseStrategy):
         raw_text: str,
         snapshots: list[OrderbookSnapshot],
         latency_ms: int,
+        blocked_tickers: set[str] | None = None,
     ) -> list[TradeIntent]:
         snap_map = {s.ticker: s for s in snapshots}
+        blocked = set(blocked_tickers) if blocked_tickers else set()
         max_slip_dollars = self.settings.max_slippage_cents / Decimal("100")
         try:
             text = raw_text.strip()
@@ -647,9 +662,12 @@ class _LLMStrategyBase(BaseStrategy):
                 if str(item.get("action", "trade")).lower() == "hold":
                     continue
                 ticker = str(item.get("ticker", ""))
+                if not ticker or ticker in blocked:
+                    continue
                 snap = snap_map.get(ticker)
                 if snap is None or snap.best_yes_bid is None or snap.best_yes_ask is None:
                     continue
+                blocked.add(ticker)
                 side = OrderSide(str(item["side"]).lower())
                 raw_price = Decimal(str(item["limit_price"]))
                 # Abort if live inside quote moved > max_slippage past AI reference price;
@@ -811,7 +829,12 @@ class _LLMStrategyBase(BaseStrategy):
             cost_usd = estimate_llm_cost_usd(
                 self.provider_name, self.settings.llm_model, p_tok, c_tok
             )
-            intents = self._parse_batch_intents(raw_text, snapshots, latency_ms)
+            blocked_tickers = {
+                k for k, p in pos_map.items() if p.net_contracts != Decimal("0")
+            } | set(portfolio.resting_order_tickers)
+            intents = self._parse_batch_intents(
+                raw_text, snapshots, latency_ms, blocked_tickers=blocked_tickers
+            )
 
             decisions: list[dict[str, Any]] = []
             if intents:

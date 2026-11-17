@@ -27,6 +27,7 @@ from kalshi_poc.models import (
     OrderSide,
     OrderbookSnapshot,
     PortfolioState,
+    Position,
     TradeIntent,
     V2CreateOrderRequest,
 )
@@ -77,12 +78,34 @@ class TradingEngine:
         self._last_discovery_monotonic: float = 0.0
         self._last_eviction_check_monotonic: float = 0.0
         self._last_hold_broadcast_monotonic: float = 0.0
+        self._last_portfolio_sync_monotonic: float = 0.0
+        self._last_resting_reap_monotonic: float = 0.0
+        self._last_quarter_bucket: int = int(time.time()) // 900
+        self._resting_order_first_seen: dict[str, float] = {}
+        self._initial_sync_done: bool = False
         self._funded_shards: set[int] = set()
         self._engine_lock = asyncio.Lock()
         self.session_start_ts: int = int(time.time() * 1000)
         self.session_starting_equity: Decimal = s.initial_capital
 
         config_manager.register_reload_callback(self._on_config_reload)
+
+    @staticmethod
+    def _ticker_series_key(ticker: str) -> str:
+        raw = ticker.strip().upper().split("-", 1)[0]
+        if raw.startswith("KXINX"):
+            return "INX"
+        if raw.startswith("KXNASDAQ"):
+            return "NASDAQ"
+        if raw.startswith("KXBTC"):
+            return "BTC"
+        if raw.startswith("KXETH"):
+            return "ETH"
+        if raw.startswith("KXSOL"):
+            return "SOL"
+        if raw.startswith("KXXRP"):
+            return "XRP"
+        return raw
 
     def _build_signer(self, s: AppSettings) -> KalshiSigner | None:
         if not s.kalshi_api_key_id.strip():
@@ -157,23 +180,201 @@ class TradingEngine:
         await self.telemetry.log_equity(self.portfolio, str(s.equity_floor), ts_ms)
         await self.telemetry.broadcast("STATUS", self.get_status())
 
-    async def sync_balance_from_api(self) -> None:
-        """Sync portfolio cash_balance from Kalshi /portfolio/balance."""
+    async def _reap_stale_resting_orders(
+        self, now_utc: datetime | None = None, now_mono: float | None = None
+    ) -> None:
+        """Poll resting orders every 10s and cancel any resting order older than 20s."""
         if self.rest_client is None or self.rest_client.signer is None:
             return
+        now = now_utc or datetime.now(timezone.utc)
+        mono = now_mono if now_mono is not None else time.monotonic()
+        self._last_resting_reap_monotonic = mono
+        try:
+            resting = await self.rest_client.get_resting_orders()
+        except Exception as exc:
+            logger.debug("Resting orders poll failed: %s", exc)
+            return
+
+        seen_ids: set[str] = set()
+        active_tickers: set[str] = set()
+        resting_collateral = Decimal("0.00")
+
+        for o in resting:
+            if not isinstance(o, dict):
+                continue
+            oid = str(o.get("order_id") or "")
+            ticker = str(o.get("ticker") or o.get("market_ticker") or "")
+            if oid:
+                seen_ids.add(oid)
+            first_seen = self._resting_order_first_seen.setdefault(oid or ticker, mono)
+            age_sec = mono - first_seen
+
+            created_raw = o.get("created_time") or o.get("last_update_time")
+            if isinstance(created_raw, str) and created_raw:
+                try:
+                    cdt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                    if cdt.tzinfo is None:
+                        cdt = cdt.replace(tzinfo=timezone.utc)
+                    age_sec = max(age_sec, (now - cdt).total_seconds())
+                except Exception:
+                    pass
+
+            if age_sec > 20.0 and oid:
+                try:
+                    await self.rest_client.cancel_order(oid, market_ticker=ticker or None)
+                    logger.info(
+                        "[REAPER] Canceled stale resting order %s on %s (age=%.1fs)",
+                        oid,
+                        ticker,
+                        age_sec,
+                    )
+                    self._resting_order_first_seen.pop(oid, None)
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "[REAPER] Failed to cancel stale resting order %s on %s: %s",
+                        oid,
+                        ticker,
+                        exc,
+                    )
+
+            if ticker:
+                active_tickers.add(ticker)
+            rem_raw = o.get("remaining_count_fp") or o.get("remaining_count") or o.get("count") or "0"
+            px_raw = (
+                o.get("yes_price_dollars")
+                or o.get("price_dollars")
+                or o.get("price")
+                or o.get("yes_price")
+                or "0.50"
+            )
+            try:
+                rem_cnt = Decimal(str(rem_raw))
+                px = Decimal(str(px_raw))
+                if px > Decimal("1"):
+                    px = px / Decimal("100")
+                side_str = str(o.get("side") or o.get("action") or "bid").lower()
+                unit_col = px if side_str in ("yes", "bid", "buy") else (Decimal("1.00") - px)
+                resting_collateral += (rem_cnt * max(Decimal("0.01"), unit_col)).quantize(
+                    Decimal("0.01")
+                )
+            except Exception:
+                pass
+
+        for k in list(self._resting_order_first_seen.keys()):
+            if k not in seen_ids and k not in active_tickers:
+                self._resting_order_first_seen.pop(k, None)
+
+        self.portfolio.resting_order_tickers = active_tickers
+        self.portfolio.resting_order_collateral_dollars = resting_collateral
+
+    async def sync_balance_from_api(self) -> None:
+        """Sync portfolio cash_balance and active non-expired positions from Kalshi API."""
+        if self.rest_client is None or self.rest_client.signer is None:
+            return
+        now_utc = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        self._last_portfolio_sync_monotonic = now_mono
         try:
             bal, _ = await self.rest_client.get_balance()
             self.portfolio.cash_balance_dollars = bal.balance_dollars
-            if not self.portfolio.positions and not self.portfolio.recent_order_timestamps_ms:
-                self.portfolio.starting_capital_dollars = bal.balance_dollars
-                self.portfolio.daily_start_equity_dollars = bal.balance_dollars
+
+            # Rebuild active open_positions strictly from non-zero, non-expired Kalshi positions
+            try:
+                open_pos_raw = await self.rest_client.get_open_positions()
+                rebuilt_positions: dict[str, Position] = {}
+                for p in open_pos_raw:
+                    ticker = str(p.get("ticker") or p.get("market_ticker") or "")
+                    if not ticker:
+                        continue
+                    raw_cnt = (
+                        p.get("position_fp")
+                        if p.get("position_fp") is not None
+                        else p.get("position", 0)
+                    )
+                    cnt = Decimal(str(raw_cnt))
+                    if cnt == Decimal("0"):
+                        continue
+
+                    exp_cached = self._market_expiries.get(ticker)
+                    if exp_cached is not None and exp_cached <= now_utc:
+                        continue
+                    is_open, exp_dt = await self.rest_client.is_market_open_and_unexpired(
+                        ticker, now_utc=now_utc
+                    )
+                    if exp_dt is not None:
+                        self._market_expiries[ticker] = exp_dt
+                    if not is_open or (exp_dt is not None and exp_dt <= now_utc):
+                        continue
+
+                    exp_val_raw = p.get("market_exposure_dollars")
+                    if exp_val_raw is None and p.get("market_exposure") is not None:
+                        exp_val_raw = Decimal(str(p["market_exposure"])) / Decimal("100")
+                    cost_basis = (
+                        Decimal(str(exp_val_raw)).quantize(Decimal("0.01"))
+                        if exp_val_raw is not None
+                        else (abs(cnt) * Decimal("0.50")).quantize(Decimal("0.01"))
+                    )
+                    unit_cost = (
+                        (cost_basis / abs(cnt)).quantize(Decimal("0.0001"))
+                        if abs(cnt) > Decimal("0")
+                        else Decimal("0.5000")
+                    )
+                    avg_entry = (
+                        min(Decimal("0.9900"), max(Decimal("0.0100"), unit_cost))
+                        if cnt > Decimal("0")
+                        else min(
+                            Decimal("0.9900"),
+                            max(Decimal("0.0100"), Decimal("1.0000") - unit_cost),
+                        )
+                    )
+                    rpnl_raw = p.get("realized_pnl_dollars")
+                    if rpnl_raw is None and p.get("realized_pnl") is not None:
+                        rpnl_raw = Decimal(str(p["realized_pnl"])) / Decimal("100")
+                    rpnl = (
+                        Decimal(str(rpnl_raw)).quantize(Decimal("0.01"))
+                        if rpnl_raw is not None
+                        else Decimal("0.00")
+                    )
+                    rebuilt_positions[ticker] = Position(
+                        ticker=ticker,
+                        net_contracts=cnt,
+                        avg_entry_price=avg_entry,
+                        cost_basis_dollars=cost_basis,
+                        realized_pnl_dollars=rpnl,
+                    )
+                    logger.info(
+                        "[PORTFOLIO] Open position: ticker=%s position=%s exposure=$%s close_in=%ss",
+                        ticker,
+                        cnt,
+                        cost_basis,
+                        f"{(exp_dt - now_utc).total_seconds():.0f}" if exp_dt else "open",
+                    )
+                s = self.config_manager.settings
+                if s.execution_mode != ExecutionMode.SHADOW:
+                    self.portfolio.positions = rebuilt_positions
+                if not rebuilt_positions:
+                    logger.info("[PORTFOLIO] Open positions: NONE (0 active non-expired positions)")
+            except Exception as pos_exc:
+                logger.debug("Open positions sync skipped/failed: %s", pos_exc)
+
+            await self._reap_stale_resting_orders(now_utc=now_utc, now_mono=now_mono)
+            if not self.portfolio.resting_order_tickers:
+                logger.info("[PORTFOLIO] Resting orders: NONE (0 resting orders)")
+
+            if not self._initial_sync_done:
+                self._initial_sync_done = True
+                self.portfolio.starting_capital_dollars = self.portfolio.current_equity_dollars
+                self.portfolio.daily_start_equity_dollars = self.portfolio.current_equity_dollars
+
             logger.info(
-                "Synced Kalshi balance: $%s (portfolio_value=$%s, shards=%s)",
+                "Synced Kalshi balance: $%s (equity=$%s, open_markets=%d, resting_orders=%d, shards=%s)",
                 bal.balance_dollars,
-                bal.portfolio_value_dollars,
+                f"{self.portfolio.current_equity_dollars:.2f}",
+                len(self.portfolio.positions),
+                len(self.portfolio.resting_order_tickers),
                 bal.balance_breakdown or {},
             )
-            await self.rest_client.log_open_positions_and_resting_orders()
             await self._broadcast_equity_and_status()
         except Exception as exc:
             logger.warning("Balance sync failed: %s", exc)
@@ -182,10 +383,45 @@ class TradingEngine:
         if self.ws_client is None:
             return
         discovered = await self._discover_tickers(s)
-        merged = list(self.ws_client.tickers)
-        for t in discovered:
-            if t not in merged and len(merged) < 6:
+        merged: list[str] = []
+        seen_series: set[str] = set()
+        seen_prefixes: set[str] = set()
+
+        # Keep existing healthy subscriptions, at most 1 per series_ticker
+        for t in self.ws_client.tickers:
+            pref = t.strip().upper().split("-", 1)[0]
+            if pref not in seen_prefixes and len(merged) < 6:
+                seen_prefixes.add(pref)
+                seen_series.add(self._ticker_series_key(t))
                 merged.append(t)
+
+        # Pass 1: Add discovered tickers from distinct underlying assets
+        for t in discovered:
+            if len(merged) >= 6:
+                break
+            sk = self._ticker_series_key(t)
+            pref = t.strip().upper().split("-", 1)[0]
+            if t not in merged and sk not in seen_series and pref not in seen_prefixes:
+                seen_series.add(sk)
+                seen_prefixes.add(pref)
+                merged.append(t)
+
+        # Pass 2: Add discovered tickers from distinct series_tickers (e.g. KXBTCD alongside KXBTC15M)
+        for t in discovered:
+            if len(merged) >= 6:
+                break
+            pref = t.strip().upper().split("-", 1)[0]
+            if t not in merged and pref not in seen_prefixes:
+                seen_prefixes.add(pref)
+                merged.append(t)
+
+        # Pass 3: Only if < 6 distinct series_tickers exist, fill remaining slots
+        for t in discovered:
+            if len(merged) >= 6:
+                break
+            if t not in merged:
+                merged.append(t)
+
         now_mono = time.monotonic()
         for t in merged:
             if t not in self._subscribed_at:
@@ -295,8 +531,14 @@ class TradingEngine:
         if shard == 0:
             return
         shard_bal = self.rest_client.shard_balances.get(shard, Decimal("0.00"))
+        shard0_bal = self.rest_client.shard_balances.get(0)
+        if shard_bal >= min_required and shard0_bal is not None and shard0_bal <= Decimal("1.00"):
+            self._funded_shards.add(shard)
+            return
         if shard_bal < min_required or shard not in self._funded_shards:
             budget = self._deployable_budget(s)
+            if shard0_bal is not None and shard0_bal > Decimal("1.00"):
+                budget = min(budget, shard0_bal)
             if budget > Decimal("0"):
                 try:
                     await self.rest_client.fund_shard(shard, budget)
@@ -352,6 +594,7 @@ class TradingEngine:
             )
             if self.rest_client is not None:
                 await self.rest_client.upgrade_api_tier_once()
+                await self.sync_balance_from_api()
 
     async def _evict_unhealthy_subscriptions(
         self, s: AppSettings, now_utc: datetime, now_mono: float | None = None
@@ -413,10 +656,37 @@ class TradingEngine:
             try:
                 now_utc = datetime.now(timezone.utc)
                 now_mono = time.monotonic()
+                quarter_bucket = int(now_utc.timestamp()) // 900
+                crossed_settlement_boundary = quarter_bucket != self._last_quarter_bucket
+                if crossed_settlement_boundary:
+                    self._last_quarter_bucket = quarter_bucket
 
-                # Every 30s, evict unhealthy tickers and refill missing slots up to 6
+                # Never count expired contracts toward Max Open Markets
+                if s.execution_mode != ExecutionMode.SHADOW and self.portfolio.positions:
+                    for t in list(self.portfolio.positions.keys()):
+                        exp = self._market_expiries.get(t)
+                        if exp is not None and exp <= now_utc:
+                            self.portfolio.positions.pop(t, None)
+
+                # Poll resting orders every 10s (reaping orders > 20s old) and sync portfolio every 15s
+                if (
+                    self.rest_client is not None
+                    and self.rest_client.signer is not None
+                    and s.execution_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE)
+                ):
+                    if crossed_settlement_boundary or (
+                        (now_mono - self._last_portfolio_sync_monotonic) >= 15.0
+                    ):
+                        await self.sync_balance_from_api()
+                    elif (now_mono - self._last_resting_reap_monotonic) >= 10.0:
+                        await self._reap_stale_resting_orders(now_utc=now_utc, now_mono=now_mono)
+
+                # Every 30s (or on 15m boundary), evict unhealthy tickers and refill missing slots up to 6
                 evicted: list[str] = []
-                maintenance_due = (now_mono - self._last_eviction_check_monotonic) >= 30.0
+                maintenance_due = (
+                    crossed_settlement_boundary
+                    or (now_mono - self._last_eviction_check_monotonic) >= 30.0
+                )
                 if maintenance_due:
                     self._last_eviction_check_monotonic = now_mono
                     evicted = await self._evict_unhealthy_subscriptions(s, now_utc, now_mono)
@@ -714,6 +984,9 @@ class TradingEngine:
                     or ("ORDER_FILLED" if filled_qty > Decimal("0") and rem_qty == Decimal("0") else "ORDER_SUBMITTED")
                 )
                 self.portfolio.recent_order_timestamps_ms.append(ts_ms)
+                if rem_qty > Decimal("0") or status.upper() in ("RESTING", "ORDER_SUBMITTED"):
+                    self._resting_order_first_seen[order_id] = time.monotonic()
+                    self.portfolio.resting_order_tickers.add(intent.ticker)
                 if filled_qty > Decimal("0") and fill_count_raw is not None:
                     self.simulator._apply_fill_to_portfolio(
                         self.portfolio,
@@ -725,6 +998,21 @@ class TradingEngine:
                         ts_ms,
                     )
                 await self.rest_client.upgrade_api_tier_once()
+
+                expected_fill_price = evaluation.estimated_fill_price
+                if intent.side == OrderSide.BID:
+                    adverse_unit_slip = max(
+                        Decimal("0.0000"), actual_fill_price - expected_fill_price
+                    )
+                else:
+                    adverse_unit_slip = max(
+                        Decimal("0.0000"), expected_fill_price - actual_fill_price
+                    )
+                effective_qty = filled_qty if filled_qty > Decimal("0") else intent.count
+                actual_slippage_dollars = (adverse_unit_slip * effective_qty).quantize(
+                    Decimal("0.0001")
+                )
+
                 rec = ExecutionRecord(
                     order_id=order_id,
                     client_order_id=v2_order.client_order_id,
@@ -732,10 +1020,10 @@ class TradingEngine:
                     ticker=intent.ticker,
                     mode=s.execution_mode,
                     side=intent.side,
-                    count=filled_qty if filled_qty > Decimal("0") else intent.count,
+                    count=effective_qty,
                     requested_price=intent.limit_price,
                     fill_price=actual_fill_price,
-                    slippage_dollars=evaluation.estimated_slippage_dollars,
+                    slippage_dollars=actual_slippage_dollars,
                     fee_dollars=actual_fee,
                     status=status,
                     timestamp_ms=ts_ms,
@@ -743,6 +1031,12 @@ class TradingEngine:
                     shadow_fee_dollars=shadow_rec.fee_dollars,
                 )
                 await self.telemetry.log_execution(rec)
+                if (
+                    filled_qty > Decimal("0")
+                    and fill_count_raw is not None
+                    and isinstance(self.rest_client.signer, KalshiSigner)
+                ):
+                    await self.sync_balance_from_api()
             except KalshiApiError as exc:
                 err = f"HTTP {exc.status_code}: {exc.message}"
                 logger.error("Order submission rejected by exchange: %s", err)
