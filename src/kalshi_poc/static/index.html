@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kalshi AI POC — Control Panel &amp; Telemetry</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased" x-data="dashboard()" x-init="init()">
+
+  <!-- Top Status Bar -->
+  <header class="sticky top-0 z-30 border-b border-slate-800 bg-slate-900/95 backdrop-blur px-4 py-3">
+    <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+      <div class="flex flex-wrap items-center gap-2.5">
+        <span class="text-lg font-bold tracking-tight text-white">Kalshi AI POC</span>
+
+        <!-- Engine State Badge -->
+        <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold uppercase tracking-wide"
+          :class="{
+            'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40': status.engine_state === 'RUNNING',
+            'bg-amber-500/20 text-amber-300 border border-amber-500/40': status.engine_state === 'PAUSED',
+            'bg-red-500/20 text-red-300 border border-red-500/40': status.engine_state === 'KILL-SWITCH TRIPPED'
+          }"
+          x-text="status.engine_state"></span>
+
+        <!-- Environment Badge -->
+        <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold uppercase"
+          :class="status.environment === 'production' ? 'bg-rose-600/30 text-rose-200 border border-rose-500/50' : 'bg-sky-500/20 text-sky-300 border border-sky-500/40'"
+          x-text="status.environment === 'production' ? 'LIVE' : 'DEMO'"></span>
+
+        <!-- Execution Mode -->
+        <span class="px-2 py-0.5 rounded bg-slate-800 text-slate-300 text-xs font-mono"
+          x-text="'mode: ' + status.execution_mode"></span>
+
+        <!-- WS Health -->
+        <span class="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs border"
+          :class="status.ws_health?.connected ? 'bg-emerald-950/60 border-emerald-700 text-emerald-300' : 'bg-slate-800 border-slate-700 text-slate-400'">
+          <span class="w-2 h-2 rounded-full" :class="status.ws_health?.connected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
+          <span x-text="status.ws_health?.connected ? 'WS Connected' : 'WS Offline'"></span>
+        </span>
+      </div>
+
+      <!-- KPIs + Controls -->
+      <div class="flex flex-wrap items-center gap-4">
+        <div class="flex items-center gap-4 text-xs">
+          <div>
+            <div class="text-slate-400">Cash Balance</div>
+            <div class="font-mono font-semibold text-sm text-white" x-text="'$' + status.cash_balance_dollars"></div>
+          </div>
+          <div>
+            <div class="text-slate-400">Deployable Budget</div>
+            <div class="font-mono font-semibold text-sm text-sky-300" x-text="'$' + status.deployable_budget_dollars"></div>
+          </div>
+          <div>
+            <div class="text-slate-400">Session Net P&amp;L</div>
+            <div class="font-mono font-semibold text-sm"
+              :class="parseFloat(status.session_net_pnl_dollars) >= 0 ? 'text-emerald-400' : 'text-rose-400'"
+              x-text="(parseFloat(status.session_net_pnl_dollars) >= 0 ? '+$' : '-$') + Math.abs(parseFloat(status.session_net_pnl_dollars || 0)).toFixed(2)"></div>
+          </div>
+          <div>
+            <div class="text-slate-400">Est. LLM Spend</div>
+            <div class="font-mono font-semibold text-sm text-amber-300"
+              x-text="'$' + parseFloat(status.estimated_llm_spend_usd || 0).toFixed(4)"></div>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <button @click="toggleEngine()"
+            class="px-3 py-1.5 rounded-lg text-xs font-semibold transition"
+            :class="status.engine_state === 'RUNNING' ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-emerald-600 hover:bg-emerald-500 text-white'"
+            x-text="status.engine_state === 'RUNNING' ? 'Pause Engine' : 'Start Engine'"></button>
+
+          <button @click="triggerEvalNow()" :disabled="evaluatingNow"
+            class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white transition"
+            x-text="evaluatingNow ? 'Evaluating...' : 'Trigger Eval Now'"></button>
+
+          <a href="/api/export/parquet"
+            class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition">
+            Export Parquet
+          </a>
+
+          <button @click="resetShadow()" :disabled="resettingShadow"
+            class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-600 text-sky-300 disabled:opacity-50 transition"
+            x-text="resettingShadow ? 'Resetting...' : 'Reset Shadow'"></button>
+
+          <button @click="emergencyKill()"
+            class="px-3 py-1.5 rounded-lg text-xs font-bold bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-900/30 transition">
+            EMERGENCY FLATTEN &amp; HALT
+          </button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto p-4 grid grid-cols-1 lg:grid-cols-12 gap-4">
+
+    <!-- Left Column: Setup & Hot-Reloadable Configuration -->
+    <section class="lg:col-span-5 space-y-3">
+
+      <!-- Card 1: Kalshi Credentials & Inline Test -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <button @click="cards.creds = !cards.creds" class="w-full px-4 py-3 flex items-center justify-between bg-slate-900 hover:bg-slate-800/60">
+          <div class="flex items-center gap-2">
+            <span class="font-semibold text-sm">1. Kalshi API Credentials</span>
+            <span x-show="config.private_key_configured" class="text-[11px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+              x-text="config.private_key_algorithm || 'Configured'"></span>
+          </div>
+          <span class="text-slate-400 text-xs" x-text="cards.creds ? '▲' : '▼'"></span>
+        </button>
+
+        <div x-show="cards.creds" class="p-4 border-t border-slate-800 space-y-3 text-xs">
+          <div>
+            <label class="block text-slate-400 mb-1">Environment</label>
+            <select x-model="config.kalshi_environment" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100">
+              <option value="demo">Demo Sandbox (external-api.demo.kalshi.co)</option>
+              <option value="production">Production (external-api.kalshi.com)</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-slate-400 mb-1">Kalshi API Key ID</label>
+            <div class="flex gap-2">
+              <input type="text" x-model="config.kalshi_api_key_id" placeholder="e.g. a1b2c3d4-..."
+                class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-slate-100" />
+              <button @click="testCredentials()" :disabled="testingCreds"
+                class="px-3 py-2 rounded-lg font-semibold bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white whitespace-nowrap">
+                <span x-text="testingCreds ? 'Testing...' : 'Test'"></span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Inline Test Result Badge -->
+          <div x-show="credTestResult" x-cloak class="p-2.5 rounded-lg border text-xs"
+            :class="credTestResult?.ok ? 'bg-emerald-950/50 border-emerald-600/50 text-emerald-200' : 'bg-rose-950/50 border-rose-600/50 text-rose-200'">
+            <template x-if="credTestResult?.ok">
+              <div class="space-y-0.5">
+                <div class="font-semibold flex items-center gap-2">
+                  <span>✓ Connection Verified</span>
+                  <span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono" x-text="credTestResult.algorithm"></span>
+                  <span class="text-slate-400 font-mono" x-text="credTestResult.latency_ms + ' ms'"></span>
+                </div>
+                <div class="font-mono">
+                  Balance: $<span x-text="credTestResult.balance_dollars"></span> |
+                  Portfolio: $<span x-text="credTestResult.portfolio_value_dollars"></span>
+                </div>
+              </div>
+            </template>
+            <template x-if="credTestResult && !credTestResult.ok">
+              <div>
+                <div class="font-semibold">✕ Authentication / Connection Failed</div>
+                <div class="font-mono mt-0.5 break-all" x-text="credTestResult.error"></div>
+              </div>
+            </template>
+          </div>
+
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <label class="text-slate-400">Private Key PEM <span x-show="config.private_key_configured" class="text-emerald-400 font-mono" x-text="'(' + config.private_key_masked + ')'"></span></label>
+              <label class="cursor-pointer text-sky-400 hover:text-sky-300 underline">
+                Upload .pem
+                <input type="file" accept=".pem,.key,.txt" class="hidden" @change="handlePemUpload($event)" />
+              </label>
+            </div>
+            <textarea rows="3" x-model="pemInput" placeholder="Paste -----BEGIN PRIVATE KEY----- ... (stored in ~/.kalshi/ with 0600 permissions)"
+              class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-[11px] text-slate-100"></textarea>
+          </div>
+
+          <button @click="saveCredentials()"
+            class="w-full py-2 rounded-lg font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white">
+            Save Credentials Securely (0600)
+          </button>
+        </div>
+      </div>
+
+      <!-- Card 2: Execution & Capital -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <button @click="cards.exec = !cards.exec" class="w-full px-4 py-3 flex items-center justify-between hover:bg-slate-800/60">
+          <span class="font-semibold text-sm">2. Execution &amp; Capital</span>
+          <span class="text-slate-400 text-xs" x-text="cards.exec ? '▲' : '▼'"></span>
+        </button>
+        <div x-show="cards.exec" class="p-4 border-t border-slate-800 grid grid-cols-2 gap-3 text-xs">
+          <div class="col-span-2">
+            <label class="block text-slate-400 mb-1">Execution Mode</label>
+            <select :value="config.execution_mode" @change="onExecutionModeChange($event)"
+              class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100">
+              <option value="paused">paused (Stream only, zero orders)</option>
+              <option value="shadow">shadow (Simulate multi-level fills)</option>
+              <option value="demo">demo (Real Demo API + Shadow calibration)</option>
+              <option value="live">live (PRODUCTION REAL MONEY)</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Initial Capital ($)</label>
+            <input type="text" x-model="config.initial_capital" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Hard Equity Floor ($)</label>
+            <input type="text" x-model="config.equity_floor" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Daily Drawdown Kill ($)</label>
+            <input type="text" x-model="config.daily_drawdown_kill_switch" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Poll Interval (ms)</label>
+            <input type="number" x-model.number="config.poll_interval_ms" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 3: Risk & Microstructure Limits -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <button @click="cards.risk = !cards.risk" class="w-full px-4 py-3 flex items-center justify-between hover:bg-slate-800/60">
+          <span class="font-semibold text-sm">3. Risk &amp; Microstructure Limits</span>
+          <span class="text-slate-400 text-xs" x-text="cards.risk ? '▲' : '▼'"></span>
+        </button>
+        <div x-show="cards.risk" class="p-4 border-t border-slate-800 grid grid-cols-2 gap-3 text-xs">
+          <div>
+            <label class="block text-slate-400 mb-1">Max Position / Market ($)</label>
+            <input type="text" x-model="config.max_position_dollars_per_market" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Max Open Markets</label>
+            <input type="number" x-model.number="config.max_open_markets" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Max Orders / Minute</label>
+            <input type="number" x-model.number="config.max_orders_per_minute" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Min Net Edge ($)</label>
+            <input type="text" x-model="config.min_net_edge_dollars" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div class="col-span-2">
+            <label class="block text-slate-400 mb-1">Max Slippage (cents)</label>
+            <input type="text" x-model="config.max_slippage_cents" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 4: Tax-Hygiene Allowlist -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <button @click="cards.tax = !cards.tax" class="w-full px-4 py-3 flex items-center justify-between hover:bg-slate-800/60">
+          <span class="font-semibold text-sm">4. Tax-Hygiene Allowlist</span>
+          <span class="text-slate-400 text-xs" x-text="cards.tax ? '▲' : '▼'"></span>
+        </button>
+        <div x-show="cards.tax" class="p-4 border-t border-slate-800 space-y-3 text-xs">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="config.enforce_financial_only" class="rounded bg-slate-950 border-slate-700 text-sky-500" />
+            <span>Enforce financial-only series allowlist</span>
+          </label>
+          <div>
+            <label class="block text-slate-400 mb-1.5">Allowed Series Prefixes</label>
+            <div class="flex flex-wrap gap-1.5 mb-2">
+              <template x-for="(prefix, idx) in config.allowed_series_prefixes" :key="prefix">
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/30 font-mono">
+                  <span x-text="prefix"></span>
+                  <button @click="config.allowed_series_prefixes.splice(idx, 1)" class="hover:text-white">&times;</button>
+                </span>
+              </template>
+            </div>
+            <div class="flex gap-2">
+              <input type="text" x-model="newPrefix" @keydown.enter.prevent="addPrefix()" placeholder="Add prefix e.g. KXGDP"
+                class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono uppercase" />
+              <button @click="addPrefix()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700">Add</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 5: AI Strategy Settings -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <button @click="cards.ai = !cards.ai" class="w-full px-4 py-3 flex items-center justify-between hover:bg-slate-800/60">
+          <span class="font-semibold text-sm">5. AI Strategy Settings</span>
+          <span class="text-slate-400 text-xs" x-text="cards.ai ? '▲' : '▼'"></span>
+        </button>
+        <div x-show="cards.ai" class="p-4 border-t border-slate-800 space-y-3 text-xs">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-slate-400 mb-1">Provider</label>
+              <select x-model="config.strategy_provider" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5">
+                <option value="stub_momentum">stub_momentum</option>
+                <option value="anthropic">anthropic</option>
+                <option value="gemini">gemini</option>
+                <option value="ollama_local">ollama_local</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Temperature</label>
+              <input type="text" x-model="config.llm_temperature" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-slate-400 mb-1">Model Name</label>
+              <input type="text" x-model="config.llm_model" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">API Key</label>
+              <input type="password" x-model="config.llm_api_key" placeholder="••••" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+            </div>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Endpoint Override (optional)</label>
+            <input type="text" x-model="config.llm_endpoint" placeholder="http://127.0.0.1:11434/api/chat" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-slate-400 mb-1">LLM Min Cooldown (s)</label>
+              <input type="number" x-model.number="config.llm_min_cooldown_sec" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">LLM Heartbeat (s)</label>
+              <input type="number" x-model.number="config.llm_heartbeat_sec" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+            </div>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">System Prompt Override</label>
+            <textarea rows="2" x-model="config.system_prompt_override" placeholder="Leave blank for default microstructure prompt"
+              class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono text-[11px]"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- Save & Apply Button -->
+      <div class="flex items-center gap-3">
+        <button @click="saveConfig()"
+          class="flex-1 py-2.5 rounded-xl font-semibold text-sm bg-sky-600 hover:bg-sky-500 text-white shadow-lg shadow-sky-900/30 transition">
+          Save &amp; Apply (Hot-Reload)
+        </button>
+        <span x-show="saveBanner" x-cloak class="text-xs text-emerald-400 font-semibold" x-text="saveBanner"></span>
+      </div>
+    </section>
+
+    <!-- Right Column: Live Multi-Pane Activity Stream -->
+    <section class="lg:col-span-7 space-y-4">
+
+      <!-- Equity & Drawdown Chart -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="font-semibold text-sm">Session Equity vs. Hard Equity Floor</h2>
+          <span class="text-xs font-mono text-slate-400">
+            Equity: $<span x-text="status.current_equity_dollars"></span> | Floor: $<span x-text="status.equity_floor_dollars"></span>
+          </span>
+        </div>
+        <div class="h-36 w-full bg-slate-950 rounded-lg border border-slate-800 p-2">
+          <svg viewBox="0 0 600 120" class="w-full h-full overflow-visible">
+            <!-- Equity Floor Reference Line -->
+            <line x1="0" :y1="floorY()" x2="600" :y2="floorY()" stroke="#ef4444" stroke-dasharray="4 4" stroke-width="1.5" />
+            <text x="6" :y="Math.max(12, floorY() - 4)" fill="#f87171" font-size="10" font-family="monospace">EQUITY_FLOOR</text>
+            <!-- Equity Polyline -->
+            <polyline fill="none" stroke="#38bdf8" stroke-width="2" :points="equityPoints()" />
+          </svg>
+        </div>
+      </div>
+
+      <!-- Active Markets & Orderbook Depth -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold text-sm">Active Markets &amp; Orderbook Depth (Derived YES/NO)</h2>
+          <span class="text-xs text-slate-400 font-mono" x-text="Object.keys(status.orderbooks || {}).length + ' tickers'"></span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-64 overflow-y-auto">
+          <template x-for="(book, ticker) in (status.orderbooks || {})" :key="ticker">
+            <div class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs">
+              <div class="flex items-center justify-between mb-2">
+                <span class="font-mono font-bold text-sky-300" x-text="ticker"></span>
+                <span class="font-mono text-slate-400" x-text="'Spread: ' + (book.spread ? ('$' + book.spread) : '--')"></span>
+              </div>
+              <div class="grid grid-cols-2 gap-2 font-mono text-[11px]">
+                <div>
+                  <div class="text-emerald-400 mb-1">YES Bids</div>
+                  <template x-for="lvl in (book.top5_yes_bids || [])" :key="'b'+lvl[0]">
+                    <div class="flex justify-between text-slate-300">
+                      <span x-text="'$' + lvl[0]"></span>
+                      <span x-text="lvl[1]"></span>
+                    </div>
+                  </template>
+                </div>
+                <div>
+                  <div class="text-rose-400 mb-1">Derived YES Asks</div>
+                  <template x-for="lvl in (book.top5_yes_asks || [])" :key="'a'+lvl[0]">
+                    <div class="flex justify-between text-slate-300">
+                      <span x-text="'$' + lvl[0]"></span>
+                      <span x-text="lvl[1]"></span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </template>
+          <div x-show="Object.keys(status.orderbooks || {}).length === 0" class="col-span-2 text-center py-6 text-xs text-slate-500">
+            Waiting for live orderbook snapshots from Kalshi WebSocket...
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Filterable Activity Feed -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <h2 class="font-semibold text-sm">Live Activity Feed</h2>
+          <div class="flex items-center gap-1.5 text-xs">
+            <template x-for="f in ['ALL', 'AI_DECISION', 'RISK_GATE', 'EXECUTION']" :key="f">
+              <button @click="feedFilter = f"
+                class="px-2.5 py-1 rounded-md font-medium transition"
+                :class="feedFilter === f ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'"
+                x-text="f"></button>
+            </template>
+          </div>
+        </div>
+
+        <div class="space-y-2 max-h-96 overflow-y-auto pr-1">
+          <template x-for="ev in filteredFeed()" :key="ev._id">
+            <div class="p-3 rounded-lg border text-xs"
+              :class="{
+                'bg-indigo-950/30 border-indigo-700/40': ev.type === 'AI_DECISION',
+                'bg-emerald-950/30 border-emerald-700/40': ev.type === 'RISK_GATE' && ev.data.approved,
+                'bg-amber-950/30 border-amber-700/40': ev.type === 'RISK_GATE' && !ev.data.approved,
+                'bg-sky-950/30 border-sky-700/40': ev.type === 'EXECUTION'
+              }">
+              <div class="flex items-center justify-between mb-1">
+                <span class="font-bold tracking-wide"
+                  :class="{
+                    'text-indigo-300': ev.type === 'AI_DECISION',
+                    'text-emerald-300': ev.type === 'RISK_GATE' && ev.data.approved,
+                    'text-amber-300': ev.type === 'RISK_GATE' && !ev.data.approved,
+                    'text-sky-300': ev.type === 'EXECUTION'
+                  }"
+                  x-text="ev.type === 'RISK_GATE' ? (ev.data.approved ? 'RISK_GATE: APPROVED' : 'RISK_GATE: REJECTED') : ev.type"></span>
+                <span class="font-mono text-slate-400" x-text="new Date(ev.data.timestamp_ms).toLocaleTimeString()"></span>
+              </div>
+
+              <template x-if="ev.type === 'AI_DECISION'">
+                <div class="text-slate-200 space-y-0.5">
+                  <div class="font-mono flex flex-wrap items-center gap-2">
+                    <span class="font-bold" x-text="ev.data.ticker"></span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase"
+                      :class="ev.data.action === 'HOLD' ? 'bg-slate-700 text-slate-300' : (ev.data.side === 'bid' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300')"
+                      x-text="ev.data.action || ev.data.side"></span>
+                    <template x-if="ev.data.action !== 'HOLD'">
+                      <span><span x-text="ev.data.count"></span> @ $<span x-text="ev.data.limit_price"></span></span>
+                    </template>
+                    <template x-if="ev.data.action === 'HOLD' && ev.data.mid_price">
+                      <span>Mid: $<span x-text="ev.data.mid_price"></span></span>
+                    </template>
+                    <template x-if="ev.data.imbalance !== undefined">
+                      <span>Imb: <span x-text="ev.data.imbalance"></span></span>
+                    </template>
+                    <span>Conf: <span x-text="ev.data.confidence"></span></span>
+                    <span class="text-slate-400" x-text="ev.data.inference_latency_ms + 'ms'"></span>
+                  </div>
+                  <div class="text-slate-400" x-text="ev.data.rationale"></div>
+                </div>
+              </template>
+
+              <template x-if="ev.type === 'RISK_GATE'">
+                <div class="text-slate-200">
+                  <div class="font-mono">
+                    <span class="font-bold" x-text="ev.data.ticker"></span> |
+                    Est Fill: $<span x-text="ev.data.estimated_fill_price"></span> |
+                    RT Fee: $<span x-text="ev.data.estimated_round_trip_fee_dollars"></span>
+                  </div>
+                  <div x-show="!ev.data.approved" class="text-amber-300 mt-1" x-text="(ev.data.rejection_reasons || []).join('; ')"></div>
+                </div>
+              </template>
+
+              <template x-if="ev.type === 'EXECUTION'">
+                <div class="font-mono" :class="ev.data.status === 'REJECTED_BY_EXCHANGE' ? 'text-rose-300' : 'text-slate-200'">
+                  <div>
+                    <span class="font-bold" x-text="ev.data.ticker"></span> [<span x-text="ev.data.mode"></span>] |
+                    Order <span x-text="ev.data.order_id"></span> |
+                    Fill $<span x-text="ev.data.fill_price"></span> |
+                    Slippage $<span x-text="ev.data.slippage_dollars"></span> |
+                    Fee $<span x-text="ev.data.fee_dollars"></span> |
+                    <span class="font-semibold" x-text="ev.data.status"></span>
+                  </div>
+                  <div x-show="ev.data.error_message" class="text-rose-400 mt-1 text-[11px]" x-text="ev.data.error_message"></div>
+                </div>
+              </template>
+            </div>
+          </template>
+          <div x-show="filteredFeed().length === 0" class="text-center py-8 text-xs text-slate-500">
+            No activity events yet. Start the engine in shadow or demo mode to observe live decisions.
+          </div>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <!-- Live Mode Confirmation Modal -->
+  <div x-show="showLiveConfirm" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+    <div class="bg-slate-900 border border-rose-600/60 rounded-xl max-w-md w-full p-5 space-y-4">
+      <h3 class="text-base font-bold text-rose-400">Confirm LIVE Production Mode</h3>
+      <p class="text-xs text-slate-300 leading-relaxed">
+        Switching execution mode to <strong class="text-white">LIVE</strong> will submit real-money orders to
+        <code class="text-rose-300">external-api.kalshi.com</code> whenever RiskGate approves an AI TradeIntent.
+      </p>
+      <div class="flex justify-end gap-2 text-xs">
+        <button @click="cancelLiveMode()" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200">Cancel</button>
+        <button @click="confirmLiveMode()" class="px-3 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold">Yes, Enable LIVE Mode</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function dashboard() {
+      return {
+        cards: { creds: true, exec: true, risk: false, tax: false, ai: false },
+        config: {
+          kalshi_environment: 'demo',
+          kalshi_api_key_id: '',
+          execution_mode: 'paused',
+          initial_capital: '5000.00',
+          equity_floor: '2000.00',
+          daily_drawdown_kill_switch: '500.00',
+          poll_interval_ms: 1000,
+          max_position_dollars_per_market: '250.00',
+          max_open_markets: 5,
+          max_orders_per_minute: 10,
+          min_net_edge_dollars: '0.02',
+          max_slippage_cents: '3',
+          allowed_series_prefixes: ['KXBTC', 'KXETH', 'KXINX', 'KXFED', 'KXCPI'],
+          enforce_financial_only: true,
+          strategy_provider: 'stub_momentum',
+          llm_api_key: '',
+          llm_endpoint: '',
+          llm_model: 'claude-3-5-sonnet-latest',
+          llm_temperature: '0.1',
+          llm_min_cooldown_sec: 15,
+          llm_heartbeat_sec: 60,
+          system_prompt_override: '',
+          private_key_configured: false,
+          private_key_masked: '',
+          private_key_algorithm: null,
+        },
+        status: {
+          engine_state: 'PAUSED',
+          environment: 'demo',
+          execution_mode: 'paused',
+          ws_health: { connected: false },
+          cash_balance_dollars: '5000.00',
+          current_equity_dollars: '5000.00',
+          equity_floor_dollars: '2000.00',
+          deployable_budget_dollars: '3000.00',
+          session_net_pnl_dollars: '0.00',
+          estimated_llm_spend_usd: '0.0000',
+          orderbooks: {},
+          equity_history: [],
+        },
+        pemInput: '',
+        newPrefix: '',
+        testingCreds: false,
+        evaluatingNow: false,
+        resettingShadow: false,
+        credTestResult: null,
+        saveBanner: '',
+        showLiveConfirm: false,
+        pendingExecutionMode: 'paused',
+        feedFilter: 'ALL',
+        feed: [],
+        ws: null,
+
+        async init() {
+          await this.loadConfig();
+          await this.loadStatus();
+          this.connectWs();
+        },
+
+        async loadConfig() {
+          const res = await fetch('/api/config');
+          if (res.ok) this.config = await res.json();
+        },
+
+        async loadStatus() {
+          const res = await fetch('/api/status');
+          if (res.ok) this.status = await res.json();
+        },
+
+        connectWs() {
+          if (this.ws) {
+            this.ws.onclose = null;
+            this.ws.close();
+          }
+          this.feed = [];
+          const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+          this.ws = new WebSocket(`${proto}//${location.host}/ws/telemetry`);
+          const execTypes = ['EXECUTION', 'SHADOW_FILL', 'SHADOW_SETTLEMENT', 'ORDER_FILLED', 'ORDER_SUBMITTED', 'REJECTED_BY_EXCHANGE'];
+          this.ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'STATUS') {
+              this.status = msg.data;
+            } else if (msg.type === 'ORDERBOOK') {
+              if (!this.status.orderbooks) this.status.orderbooks = {};
+              this.status.orderbooks[msg.data.ticker] = msg.data;
+            } else if (msg.type === 'EQUITY') {
+              if (!this.status.equity_history) this.status.equity_history = [];
+              this.status.equity_history.push({
+                timestamp_ms: msg.data.timestamp_ms,
+                equity: msg.data.current_equity_dollars,
+                floor: msg.data.equity_floor_dollars,
+              });
+              if (this.status.equity_history.length > 200) this.status.equity_history.shift();
+            } else if (['AI_DECISION', 'RISK_GATE', ...execTypes].includes(msg.type)) {
+              this.feed.unshift({ ...msg, _id: `${msg.type}-${Date.now()}-${Math.random()}` });
+              if (this.feed.length > 200) this.feed.pop();
+            }
+          };
+          this.ws.onclose = () => setTimeout(() => this.connectWs(), 2000);
+        },
+
+        filteredFeed() {
+          if (this.feedFilter === 'ALL') return this.feed;
+          if (this.feedFilter === 'EXECUTION') {
+            const execTypes = ['EXECUTION', 'SHADOW_FILL', 'SHADOW_SETTLEMENT', 'ORDER_FILLED', 'ORDER_SUBMITTED', 'REJECTED_BY_EXCHANGE'];
+            return this.feed.filter((x) => execTypes.includes(x.type) || execTypes.includes(x.data?.status));
+          }
+          return this.feed.filter((x) => x.type === this.feedFilter);
+        },
+
+        handlePemUpload(evt) {
+          const file = evt.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (e) => { this.pemInput = e.target.result; };
+          reader.readAsText(file);
+        },
+
+        async testCredentials() {
+          this.testingCreds = true;
+          this.credTestResult = null;
+          try {
+            const res = await fetch('/api/credentials/test', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                environment: this.config.kalshi_environment,
+                api_key_id: this.config.kalshi_api_key_id,
+                private_key_pem: this.pemInput,
+              }),
+            });
+            this.credTestResult = await res.json();
+          } catch (err) {
+            this.credTestResult = { ok: false, error: String(err) };
+          } finally {
+            this.testingCreds = false;
+          }
+        },
+
+        async saveCredentials() {
+          const res = await fetch('/api/credentials/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              environment: this.config.kalshi_environment,
+              api_key_id: this.config.kalshi_api_key_id,
+              private_key_pem: this.pemInput,
+            }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            this.config = data.config;
+            this.pemInput = '';
+            this.saveBanner = 'Credentials saved (0600)';
+            setTimeout(() => { this.saveBanner = ''; }, 3000);
+          }
+        },
+
+        onExecutionModeChange(evt) {
+          const val = evt.target.value;
+          if (val === 'live') {
+            this.pendingExecutionMode = 'live';
+            this.showLiveConfirm = true;
+            evt.target.value = this.config.execution_mode;
+          } else {
+            this.config.execution_mode = val;
+          }
+        },
+
+        confirmLiveMode() {
+          this.config.execution_mode = this.pendingExecutionMode;
+          this.showLiveConfirm = false;
+        },
+
+        cancelLiveMode() {
+          this.showLiveConfirm = false;
+        },
+
+        addPrefix() {
+          const p = this.newPrefix.trim().toUpperCase();
+          if (p && !this.config.allowed_series_prefixes.includes(p)) {
+            this.config.allowed_series_prefixes.push(p);
+          }
+          this.newPrefix = '';
+        },
+
+        async saveConfig() {
+          const payload = { ...this.config };
+          if (this.pemInput.trim()) payload.private_key_pem = this.pemInput;
+          const res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            this.config = data.config;
+            this.pemInput = '';
+            this.saveBanner = data.warning || 'Saved & hot-reloaded!';
+            await this.loadStatus();
+            setTimeout(() => { this.saveBanner = ''; }, 5000);
+          }
+        },
+
+        async toggleEngine() {
+          const url = this.status.engine_state === 'RUNNING' ? '/api/engine/pause' : '/api/engine/start';
+          const res = await fetch(url, { method: 'POST' });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.status) this.status = data.status;
+            await this.loadConfig();
+          }
+        },
+
+        async triggerEvalNow() {
+          this.evaluatingNow = true;
+          try {
+            const res = await fetch('/api/engine/eval-now', { method: 'POST' });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.status) this.status = data.status;
+            }
+          } finally {
+            this.evaluatingNow = false;
+          }
+        },
+
+        async resetShadow() {
+          this.resettingShadow = true;
+          try {
+            const res = await fetch('/api/engine/reset-shadow', { method: 'POST' });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.status) this.status = data.status;
+            }
+          } finally {
+            this.resettingShadow = false;
+          }
+        },
+
+        async emergencyKill() {
+          const res = await fetch('/api/engine/kill', { method: 'POST' });
+          if (res.ok) {
+            await this.loadStatus();
+            await this.loadConfig();
+          }
+        },
+
+        _chartBounds() {
+          const hist = this.status.equity_history || [];
+          const floor = parseFloat(this.status.equity_floor_dollars || 0);
+          const vals = hist.map((p) => parseFloat(p.equity));
+          vals.push(parseFloat(this.status.current_equity_dollars || floor));
+          vals.push(floor);
+          const minV = Math.min(...vals) * 0.98;
+          const maxV = Math.max(...vals) * 1.02 || 100;
+          return { minV, maxV: maxV === minV ? minV + 100 : maxV, floor };
+        },
+
+        floorY() {
+          const { minV, maxV, floor } = this._chartBounds();
+          const norm = (floor - minV) / (maxV - minV);
+          return (110 - norm * 100).toFixed(1);
+        },
+
+        equityPoints() {
+          const hist = this.status.equity_history || [];
+          if (hist.length === 0) return '0,55 600,55';
+          const { minV, maxV } = this._chartBounds();
+          return hist.map((pt, i) => {
+            const x = hist.length === 1 ? 300 : (i / (hist.length - 1)) * 600;
+            const norm = (parseFloat(pt.equity) - minV) / (maxV - minV);
+            const y = 110 - norm * 100;
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+          }).join(' ');
+        },
+      };
+    }
+  </script>
+</body>
+</html>

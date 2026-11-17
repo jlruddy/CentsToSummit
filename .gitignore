@@ -221,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Kalshi POC runtime & secrets
+data/
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+*.pem
+config.json
+

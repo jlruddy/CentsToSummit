@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kalshi-poc"
+version = "0.1.0"
+description = "Production-grade local POC automated trading system for Kalshi prediction markets with deterministic risk enforcement and Web UI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.2",
+    "websockets>=13.1",
+    "cryptography>=43.0.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "aiosqlite>=0.20.0",
+    "duckdb>=1.1.0",
+    "pyarrow>=17.0.0",
+    "python-multipart>=0.0.12",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+kalshi-poc = "kalshi_poc.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kalshi_poc"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
