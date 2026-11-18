@@ -58,6 +58,14 @@ class SelfTradePrevention(str, Enum):
     MAKER = "maker"
 
 
+CLIENT_ORDER_ID_PREFIX = "c2s-"
+
+
+def new_client_order_id() -> str:
+    """Engine-tagged client_order_id so the reaper only ever touches orders this engine placed."""
+    return f"{CLIENT_ORDER_ID_PREFIX}{uuid.uuid4()}"
+
+
 def _to_decimal(v: object) -> Decimal:
     """Coerce string, int, or Decimal to Decimal without float imprecision."""
     if isinstance(v, Decimal):
@@ -338,7 +346,7 @@ class V2CreateOrderRequest(BaseModel):
     price: str
     time_in_force: TimeInForce = TimeInForce.IMMEDIATE_OR_CANCEL
     self_trade_prevention_type: SelfTradePrevention = SelfTradePrevention.TAKER_AT_CROSS
-    client_order_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_order_id: str = Field(default_factory=new_client_order_id)
     exchange_index: int | None = None
 
     @classmethod
@@ -357,7 +365,7 @@ class V2CreateOrderRequest(BaseModel):
             price=price_str,
             time_in_force=intent.time_in_force,
             self_trade_prevention_type=SelfTradePrevention.TAKER_AT_CROSS,
-            client_order_id=str(uuid.uuid4()),
+            client_order_id=new_client_order_id(),
         )
 
 

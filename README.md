@@ -50,7 +50,10 @@ Upload the `.pem` public key in your Kalshi Demo (or Production) account setting
 ## 3. Web UI Control Panel Guide
 
 - **Top Status Bar:** Shows Engine State (`RUNNING` / `PAUSED` / `KILL-SWITCH TRIPPED`), Environment (`DEMO` / `LIVE`), WebSocket health, Cash Balance, Deployable Risk Budget (`Equity - Floor`), and Session Net P&L.
-- **Emergency Flatten & Halt:** Immediately trips the kill-switch, cancels all resting orders, and pauses execution.
+- **Emergency Flatten & Halt:** Trips the kill-switch (persisted across restarts), pauses new entries, cancels resting orders (demo/live), and sends one IOC closing order per open position at the live inside quote. The response lists each position's flatten status and any remaining contracts.
+- **Pause vs. kill-switch:** Both block *new entries only*. Take-profit / stop-loss exits keep running for positions opened in the mode that was active before the pause or kill. A process that boots already paused does not touch positions until you press Start. Pressing Start is the explicit operator action that clears a tripped kill-switch.
+- **Live trading gate:** `execution_mode=live` is rejected by the server (UI, API, and Start) unless the process was launched with `--confirm-live`.
+- **Access control:** The control panel only answers requests whose `Host` is `127.0.0.1`, `localhost`, or `::1`, and rejects cross-site writes and WebSocket connections (by `Origin`). If you serve it under another hostname, add it to `WEB_ALLOWED_HOSTS` (JSON array).
 - **Hot-Reloadable Config Cards:** Edit Execution Mode (`paused`, `shadow`, `demo`, `live`), Capital & Equity Floor, Risk & Microstructure Limits, Tax-Hygiene Series Allowlist, and AI Strategy Provider (`stub_momentum`, `anthropic`, `gemini`, `ollama_local`), then click **Save & Apply** without dropping active WebSocket feeds.
 - **Live Activity Stream:** Inspect derived YES/NO orderbook depth, filterable `AI_DECISION` / `RISK_GATE` / `EXECUTION` cards, and the live equity vs. `EQUITY_FLOOR` chart.
 
@@ -65,7 +68,8 @@ uv run kalshi-poc run
 # Start with explicit host/port or allow live production mode
 uv run kalshi-poc run --host 127.0.0.1 --port 8000 --confirm-live
 
-# Export all 5 SQLite WAL telemetry tables to Parquet
+# Export all SQLite WAL telemetry tables (full history) to Parquet:
+# orderbook_snapshots, ai_decisions, llm_calls, risk_evaluations, orders_and_fills, equity_curve, exchange_events
 uv run kalshi-poc export --format parquet --output-dir data/exports
 
 # Run test suite

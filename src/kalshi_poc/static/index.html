@@ -736,6 +736,12 @@
             this.saveBanner = data.warning || 'Saved & hot-reloaded!';
             await this.loadStatus();
             setTimeout(() => { this.saveBanner = ''; }, 5000);
+          } else {
+            let detail = `Save failed (HTTP ${res.status})`;
+            try { detail = (await res.json()).detail || detail; } catch (e) {}
+            this.saveBanner = detail;
+            await this.loadConfig();
+            setTimeout(() => { this.saveBanner = ''; }, 8000);
           }
         },
 
@@ -746,6 +752,11 @@
             const data = await res.json();
             if (data.status) this.status = data.status;
             await this.loadConfig();
+          } else {
+            let detail = `Request failed (HTTP ${res.status})`;
+            try { detail = (await res.json()).detail || detail; } catch (e) {}
+            this.saveBanner = detail;
+            setTimeout(() => { this.saveBanner = ''; }, 8000);
           }
         },
 

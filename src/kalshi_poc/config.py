@@ -72,6 +72,20 @@ class AppSettings(BaseSettings):
     db_path: str = Field(default="data/kalshi_telemetry.db")
     web_host: str = Field(default="127.0.0.1")
     web_port: int = Field(default=8000, ge=1, le=65535)
+    # Extra Host/Origin hostnames accepted by the control panel (127.0.0.1/localhost/::1 always are)
+    web_allowed_hosts: list[str] = Field(default_factory=list)
+
+    @field_validator("web_allowed_hosts", mode="before")
+    @classmethod
+    def parse_host_list(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            v = json.loads(v) if v.startswith("[") else v.split(",")
+        if isinstance(v, list):
+            return [str(x).strip().lower() for x in v if str(x).strip()]
+        return []
 
     @field_validator("allowed_series_prefixes", "subscribed_tickers", mode="before")
     @classmethod
@@ -104,6 +118,11 @@ class AppSettings(BaseSettings):
         return Path(self.kalshi_private_key_path).expanduser()
 
 
+def _q(value: str) -> str:
+    """Double-quote a .env value (dotenv decodes the escapes) so newlines/#/quotes cannot inject."""
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _atomic_write(path: Path, content: str, mode: int | None = None) -> None:
     """Write content atomically using a temporary file and os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,8 +149,11 @@ class ConfigManager:
         env_path: Path | str = ".env",
         config_json_path: Path | str = "config.json",
         key_dir: Path | str = "~/.kalshi",
+        allow_live: bool = False,
     ) -> None:
         self._lock = threading.RLock()
+        # C2: live execution is only reachable when the process was started with --confirm-live
+        self.allow_live = allow_live
         self.env_path = Path(env_path)
         self.config_json_path = Path(config_json_path)
         self.key_dir = Path(key_dir).expanduser()
@@ -219,6 +241,11 @@ class ConfigManager:
 
             current.update(cleaned)
             new_settings = AppSettings.model_validate(current)
+            if new_settings.execution_mode == ExecutionMode.LIVE and not self.allow_live:
+                raise ValueError(
+                    "execution_mode=live is disabled: restart with `kalshi-poc run --confirm-live` "
+                    "to allow real-money trading."
+                )
 
             self._persist_files(new_settings)
             self._settings = new_settings
@@ -234,8 +261,8 @@ class ConfigManager:
 
         env_lines = [
             f"KALSHI_ENVIRONMENT={s.kalshi_environment.value}",
-            f"KALSHI_API_KEY_ID={s.kalshi_api_key_id}",
-            f"KALSHI_PRIVATE_KEY_PATH={s.kalshi_private_key_path}",
+            f"KALSHI_API_KEY_ID={_q(s.kalshi_api_key_id)}",
+            f"KALSHI_PRIVATE_KEY_PATH={_q(s.kalshi_private_key_path)}",
             f"EXECUTION_MODE={s.execution_mode.value}",
             f"INITIAL_CAPITAL={s.initial_capital}",
             f"EQUITY_FLOOR={s.equity_floor}",
@@ -253,15 +280,16 @@ class ConfigManager:
             f"PREFER_15M_TURNOVER={str(s.prefer_15m_turnover).lower()}",
             f"SUBSCRIBED_TICKERS={json.dumps(s.subscribed_tickers)}",
             f"STRATEGY_PROVIDER={s.strategy_provider.value}",
-            f"LLM_API_KEY={s.llm_api_key}",
-            f"LLM_ENDPOINT={s.llm_endpoint}",
-            f"LLM_MODEL={s.llm_model}",
+            f"LLM_API_KEY={_q(s.llm_api_key)}",
+            f"LLM_ENDPOINT={_q(s.llm_endpoint)}",
+            f"LLM_MODEL={_q(s.llm_model)}",
             f"LLM_TEMPERATURE={s.llm_temperature}",
-            f"SYSTEM_PROMPT_OVERRIDE={json.dumps(s.system_prompt_override)}",
+            f"SYSTEM_PROMPT_OVERRIDE={_q(s.system_prompt_override)}",
             f"LLM_MIN_COOLDOWN_SEC={s.llm_min_cooldown_sec}",
             f"LLM_HEARTBEAT_SEC={s.llm_heartbeat_sec}",
-            f"DB_PATH={s.db_path}",
-            f"WEB_HOST={s.web_host}",
+            f"DB_PATH={_q(s.db_path)}",
+            f"WEB_HOST={_q(s.web_host)}",
             f"WEB_PORT={s.web_port}",
+            f"WEB_ALLOWED_HOSTS={json.dumps(s.web_allowed_hosts)}",
         ]
         _atomic_write(self.env_path, "\n".join(env_lines) + "\n", mode=0o600)

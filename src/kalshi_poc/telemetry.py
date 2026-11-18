@@ -26,14 +26,18 @@ from kalshi_poc.models import (
 TABLES = (
     "orderbook_snapshots",
     "ai_decisions",
+    "llm_calls",
     "risk_evaluations",
     "orders_and_fills",
     "equity_curve",
+    "exchange_events",
 )
+EXPORT_CHUNK_ROWS = 20_000
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS orderbook_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
     timestamp_ms INTEGER NOT NULL,
     ticker TEXT NOT NULL,
     best_yes_bid TEXT,
@@ -47,6 +51,7 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
 
 CREATE TABLE IF NOT EXISTS ai_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
     timestamp_ms INTEGER NOT NULL,
     intent_id TEXT NOT NULL,
     ticker TEXT NOT NULL,
@@ -60,11 +65,35 @@ CREATE TABLE IF NOT EXISTS ai_decisions (
     rationale TEXT NOT NULL,
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
-    estimated_cost_usd TEXT DEFAULT '0.000000'
+    estimated_cost_usd TEXT DEFAULT '0.000000',
+    expected_edge_per_contract TEXT DEFAULT '',
+    hold_to_expiry INTEGER DEFAULT 0,
+    decision_status TEXT DEFAULT '',
+    llm_call_id TEXT DEFAULT '',
+    raw_proposal_json TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
+    timestamp_ms INTEGER NOT NULL,
+    llm_call_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT DEFAULT '',
+    trigger_reason TEXT DEFAULT '',
+    system_prompt TEXT DEFAULT '',
+    user_prompt TEXT DEFAULT '',
+    raw_response TEXT DEFAULT '',
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd TEXT DEFAULT '0.000000',
+    latency_ms INTEGER DEFAULT 0,
+    error TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS risk_evaluations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
     timestamp_ms INTEGER NOT NULL,
     intent_id TEXT NOT NULL,
     ticker TEXT NOT NULL,
@@ -110,10 +139,28 @@ CREATE TABLE IF NOT EXISTS equity_curve (
     equity_floor_dollars TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS exchange_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
+    timestamp_ms INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    ticker TEXT DEFAULT '',
+    order_id TEXT DEFAULT '',
+    trade_id TEXT DEFAULT '',
+    raw_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS engine_state (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_ai_decisions_ts ON ai_decisions(timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_risk_evaluations_ts ON risk_evaluations(timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_and_fills_ts ON orders_and_fills(timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_equity_curve_ts ON equity_curve(timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(timestamp_ms DESC);
 """
 
 
@@ -168,7 +215,8 @@ class TelemetryManager:
             """
             SELECT timestamp_ms, intent_id, ticker, side, count, limit_price,
                    expected_edge_dollars, confidence, inference_latency_ms, provider,
-                   rationale, prompt_tokens, completion_tokens, estimated_cost_usd
+                   rationale, prompt_tokens, completion_tokens, estimated_cost_usd,
+                   decision_status
             FROM ai_decisions
             ORDER BY timestamp_ms DESC, id DESC
             LIMIT ?
@@ -178,6 +226,8 @@ class TelemetryManager:
             for r in await cur.fetchall():
                 side_val = r[3]
                 action = "HOLD" if side_val == "hold" else ("BUY" if side_val == "bid" else "SELL")
+                if r[14] in ("FILTERED", "PARSE_ERROR"):
+                    action = "REJECTED"
                 events.append(
                     {
                         "type": "AI_DECISION",
@@ -197,6 +247,7 @@ class TelemetryManager:
                             "prompt_tokens": r[11] or 0,
                             "completion_tokens": r[12] or 0,
                             "estimated_cost_usd": r[13] or "0.000000",
+                            "decision_status": r[14] or "",
                         },
                     }
                 )
@@ -281,7 +332,13 @@ class TelemetryManager:
         await self._db.execute("PRAGMA journal_mode=WAL;")
         await self._db.execute("PRAGMA synchronous=NORMAL;")
         await self._db.executescript(SCHEMA_SQL)
-        for tbl in ("orders_and_fills", "equity_curve"):
+        for tbl in (
+            "orders_and_fills",
+            "equity_curve",
+            "orderbook_snapshots",
+            "ai_decisions",
+            "risk_evaluations",
+        ):
             try:
                 await self._db.execute(f"ALTER TABLE {tbl} ADD COLUMN session_id TEXT DEFAULT ''")
             except Exception:
@@ -290,6 +347,11 @@ class TelemetryManager:
             "prompt_tokens INTEGER DEFAULT 0",
             "completion_tokens INTEGER DEFAULT 0",
             "estimated_cost_usd TEXT DEFAULT '0.000000'",
+            "expected_edge_per_contract TEXT DEFAULT ''",
+            "hold_to_expiry INTEGER DEFAULT 0",
+            "decision_status TEXT DEFAULT ''",
+            "llm_call_id TEXT DEFAULT ''",
+            "raw_proposal_json TEXT DEFAULT ''",
         ):
             try:
                 await self._db.execute(f"ALTER TABLE ai_decisions ADD COLUMN {col_def}")
@@ -333,11 +395,12 @@ class TelemetryManager:
                 await self._db.execute(
                     """
                     INSERT INTO orderbook_snapshots (
-                        timestamp_ms, ticker, best_yes_bid, best_yes_ask,
+                        session_id, timestamp_ms, ticker, best_yes_bid, best_yes_ask,
                         best_no_bid, best_no_ask, spread, yes_bids_json, no_bids_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        self.session_id,
                         snap.timestamp_ms,
                         snap.ticker,
                         str(snap.best_yes_bid) if snap.best_yes_bid is not None else None,
@@ -348,9 +411,6 @@ class TelemetryManager:
                         json.dumps(yes_bids),
                         json.dumps(no_bids),
                     ),
-                )
-                await self._db.execute(
-                    "DELETE FROM orderbook_snapshots WHERE id <= (SELECT MAX(id) - 5000 FROM orderbook_snapshots)"
                 )
                 await self._db.commit()
 
@@ -383,18 +443,26 @@ class TelemetryManager:
         payload["prompt_tokens"] = prompt_tokens
         payload["completion_tokens"] = completion_tokens
         payload["estimated_cost_usd"] = f"{cost_dec:.6f}"
+        side_val = str(payload.get("side", "hold"))
+        payload.setdefault("decision_status", "HOLD" if side_val == "hold" else "PROPOSED")
+        raw_prop = payload.pop("raw_proposal", None)
+        raw_prop_json = json.dumps(raw_prop, default=str) if raw_prop is not None else ""
+        edge_pc = payload.get("expected_edge_per_contract")
 
         if self._db is not None:
             async with self._write_lock:
                 await self._db.execute(
                     """
                     INSERT INTO ai_decisions (
-                        timestamp_ms, intent_id, ticker, side, count, limit_price,
+                        session_id, timestamp_ms, intent_id, ticker, side, count, limit_price,
                         expected_edge_dollars, confidence, inference_latency_ms, provider,
-                        rationale, prompt_tokens, completion_tokens, estimated_cost_usd
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        rationale, prompt_tokens, completion_tokens, estimated_cost_usd,
+                        expected_edge_per_contract, hold_to_expiry, decision_status,
+                        llm_call_id, raw_proposal_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        self.session_id,
                         int(payload["timestamp_ms"]),
                         str(payload["intent_id"]),
                         str(payload["ticker"]),
@@ -409,11 +477,48 @@ class TelemetryManager:
                         prompt_tokens,
                         completion_tokens,
                         f"{cost_dec:.6f}",
+                        str(edge_pc) if edge_pc is not None else "",
+                        1 if payload.get("hold_to_expiry") else 0,
+                        str(payload.get("decision_status", "")),
+                        str(payload.get("llm_call_id", "") or ""),
+                        raw_prop_json,
                     ),
                 )
                 await self._db.commit()
 
         await self.broadcast("AI_DECISION", payload)
+
+    async def log_llm_call(self, call: dict[str, Any]) -> None:
+        """Persist one LLM request/response verbatim (prompts, raw text, tokens, cost, error)."""
+        if self._db is None:
+            return
+        async with self._write_lock:
+            await self._db.execute(
+                """
+                INSERT INTO llm_calls (
+                    session_id, timestamp_ms, llm_call_id, provider, model, trigger_reason,
+                    system_prompt, user_prompt, raw_response, prompt_tokens, completion_tokens,
+                    estimated_cost_usd, latency_ms, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.session_id,
+                    int(call.get("timestamp_ms") or time.time() * 1000),
+                    str(call.get("llm_call_id", "")),
+                    str(call.get("provider", "")),
+                    str(call.get("model", "")),
+                    str(call.get("trigger_reason", "")),
+                    str(call.get("system_prompt", "")),
+                    str(call.get("user_prompt", "")),
+                    str(call.get("raw_response", "")),
+                    int(call.get("prompt_tokens", 0) or 0),
+                    int(call.get("completion_tokens", 0) or 0),
+                    str(call.get("estimated_cost_usd", "0.000000")),
+                    int(call.get("latency_ms", 0) or 0),
+                    str(call.get("error", "")),
+                ),
+            )
+            await self._db.commit()
 
     async def log_risk_evaluation(self, evaluation: RiskEvaluation) -> None:
         if self._db is not None:
@@ -421,13 +526,14 @@ class TelemetryManager:
                 await self._db.execute(
                     """
                     INSERT INTO risk_evaluations (
-                        timestamp_ms, intent_id, ticker, approved, rejection_reasons_json,
-                        estimated_fill_price, estimated_slippage_dollars,
+                        session_id, timestamp_ms, intent_id, ticker, approved,
+                        rejection_reasons_json, estimated_fill_price, estimated_slippage_dollars,
                         estimated_entry_fee_dollars, estimated_round_trip_fee_dollars,
                         worst_case_equity_after
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        self.session_id,
                         evaluation.timestamp_ms,
                         evaluation.intent_id,
                         evaluation.ticker,
@@ -479,6 +585,69 @@ class TelemetryManager:
 
         await self.broadcast("EXECUTION", record.model_dump(mode="json"))
 
+    async def save_state(self, key: str, value: dict[str, Any]) -> None:
+        """Durably upsert a small engine-state record (kill-switch, daily baseline, last mode)."""
+        if self._db is None:
+            return
+        async with self._write_lock:
+            await self._db.execute(
+                """
+                INSERT INTO engine_state (key, value_json, updated_ms) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json,
+                                               updated_ms = excluded.updated_ms
+                """,
+                (key, json.dumps(value, default=str), int(time.time() * 1000)),
+            )
+            await self._db.commit()
+
+    async def load_state(self, key: str) -> dict[str, Any] | None:
+        if self._db is None:
+            return None
+        async with self._db.execute(
+            "SELECT value_json FROM engine_state WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def log_exchange_event(
+        self,
+        event_type: str,
+        payload: Any,
+        *,
+        ticker: str = "",
+        order_id: str = "",
+        trade_id: str = "",
+        timestamp_ms: int | None = None,
+    ) -> None:
+        """Persist raw exchange payloads (fills, order responses) verbatim for later verification."""
+        if self._db is None:
+            return
+        ts = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
+        async with self._write_lock:
+            await self._db.execute(
+                """
+                INSERT INTO exchange_events (
+                    session_id, timestamp_ms, event_type, ticker, order_id, trade_id, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.session_id,
+                    ts,
+                    event_type,
+                    ticker,
+                    order_id,
+                    trade_id,
+                    json.dumps(payload, default=str),
+                ),
+            )
+            await self._db.commit()
+
     async def log_equity(
         self, portfolio: PortfolioState, equity_floor: str, timestamp_ms: int
     ) -> None:
@@ -516,8 +685,19 @@ class TelemetryManager:
         return await asyncio.to_thread(export_parquet_zip, self.db_path, output_dir)
 
 
+def _arrow_schema_for_table(conn: sqlite3.Connection, table: str) -> Any:
+    """Build a stable Arrow schema from SQLite declared column types (INTEGER -> int64, else str)."""
+    import pyarrow as pa
+
+    fields = []
+    for _, name, decl_type, *_ in conn.execute(f"PRAGMA table_info({table})"):
+        arrow_type = pa.int64() if "INT" in str(decl_type).upper() else pa.string()
+        fields.append(pa.field(name, arrow_type))
+    return pa.schema(fields)
+
+
 def export_sqlite_to_parquet(db_path: str | Path, output_dir: str | Path) -> list[Path]:
-    """Export all 5 SQLite telemetry tables to Parquet files using sqlite3 + PyArrow (zero mmap)."""
+    """Export every telemetry table in full (oldest first) to Parquet, streaming in chunks."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -534,16 +714,35 @@ def export_sqlite_to_parquet(db_path: str | Path, output_dir: str | Path) -> lis
     sconn = sqlite3.connect(db_file, timeout=10.0)
     sconn.execute("PRAGMA busy_timeout=5000;")
     sconn.execute("PRAGMA mmap_size=0;")
-    sconn.row_factory = sqlite3.Row
     try:
+        existing = {
+            r[0] for r in sconn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
         for table in TABLES:
-            cur = sconn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT 50000")
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description] if cur.description else []
-            data = {col: [r[col] for r in reversed(rows)] for col in cols}
-            arrow_tbl = pa.table(data)
+            if table not in existing:
+                sconn.executescript(SCHEMA_SQL)
+            schema = _arrow_schema_for_table(sconn, table)
+            cols = schema.names
             out_file = out_dir / f"{table}.parquet"
-            pq.write_table(arrow_tbl, out_file)
+            cur = sconn.execute(f"SELECT {', '.join(cols)} FROM {table} ORDER BY id ASC")
+            with pq.ParquetWriter(out_file, schema) as writer:
+                wrote_any = False
+                while True:
+                    rows = cur.fetchmany(EXPORT_CHUNK_ROWS)
+                    if not rows:
+                        break
+                    columns = list(zip(*rows))
+                    data = {
+                        name: [
+                            (None if v is None else (int(v) if pa.types.is_integer(f.type) else str(v)))
+                            for v in columns[i]
+                        ]
+                        for i, (name, f) in enumerate(zip(cols, schema))
+                    }
+                    writer.write_table(pa.table(data, schema=schema))
+                    wrote_any = True
+                if not wrote_any:
+                    writer.write_table(schema.empty_table())
             exported.append(out_file)
     finally:
         sconn.close()

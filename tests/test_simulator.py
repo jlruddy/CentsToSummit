@@ -138,3 +138,83 @@ def test_shadow_auto_settles_expired_positions() -> None:
     assert portfolio.cash_balance_dollars == Decimal("14.00")
     assert "KXBTC15M-WIN" not in portfolio.positions
     assert "KXBTC15M-OPEN" in portfolio.positions
+
+
+# --- C1: symmetric short (NO) accounting in _apply_fill_to_portfolio ---------------------
+
+
+def _flat_portfolio(cash: str = "1000.00") -> PortfolioState:
+    c = Decimal(cash)
+    return PortfolioState(
+        cash_balance_dollars=c, starting_capital_dollars=c, daily_start_equity_dollars=c
+    )
+
+
+def test_short_round_trip_at_same_price_returns_cash() -> None:
+    p = _flat_portfolio()
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("10"), Decimal("0.40"), Decimal("0"), 0)
+    assert p.cash_balance_dollars == Decimal("994.00")
+    assert p.positions["T"].net_contracts == Decimal("-10")
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.BID, Decimal("10"), Decimal("0.40"), Decimal("0"), 0)
+    assert p.cash_balance_dollars == Decimal("1000.00")
+    assert "T" not in p.positions
+
+
+def test_short_close_at_profit_credits_no_proceeds_minus_fee() -> None:
+    p = _flat_portfolio()
+    # Buy 10 NO @ (1 - 0.40) = $6.00, fee $0.17
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("10"), Decimal("0.40"), Decimal("0.17"), 0)
+    assert p.cash_balance_dollars == Decimal("993.83")
+    # YES falls to 0.30 -> close by buying YES: credit 10 * 0.70 - fee 0.15
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.BID, Decimal("10"), Decimal("0.30"), Decimal("0.15"), 0)
+    assert p.cash_balance_dollars == Decimal("1000.68")
+    assert "T" not in p.positions
+
+
+def test_partial_short_close_reduces_cost_basis_and_books_realized_pnl() -> None:
+    p = _flat_portfolio()
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("10"), Decimal("0.40"), Decimal("0"), 0)
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.BID, Decimal("4"), Decimal("0.30"), Decimal("0"), 0)
+    pos = p.positions["T"]
+    assert pos.net_contracts == Decimal("-6")
+    assert pos.cost_basis_dollars == Decimal("3.60")  # 6 NO @ $0.60
+    assert pos.avg_entry_price == Decimal("0.4000")
+    assert pos.realized_pnl_dollars == Decimal("0.40")  # 4 * (0.40 - 0.30)
+    assert p.cash_balance_dollars == Decimal("996.80")  # 994.00 + 4 * 0.70
+
+
+def test_short_to_long_flip_opens_remainder_at_fill_price() -> None:
+    p = _flat_portfolio()
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("4"), Decimal("0.40"), Decimal("0"), 0)
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.BID, Decimal("10"), Decimal("0.50"), Decimal("0"), 0)
+    pos = p.positions["T"]
+    assert pos.net_contracts == Decimal("6")
+    assert pos.cost_basis_dollars == Decimal("3.00")
+    assert pos.avg_entry_price == Decimal("0.5000")
+    # 1000 - 2.40 (open NO) + 4 * 0.50 (close NO) - 6 * 0.50 (open YES)
+    assert p.cash_balance_dollars == Decimal("996.60")
+
+
+def test_adding_to_short_averages_yes_entry_price() -> None:
+    p = _flat_portfolio()
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("10"), Decimal("0.40"), Decimal("0"), 0)
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("10"), Decimal("0.30"), Decimal("0"), 0)
+    pos = p.positions["T"]
+    assert pos.net_contracts == Decimal("-20")
+    assert pos.cost_basis_dollars == Decimal("13.00")  # 10 * 0.60 + 10 * 0.70
+    assert pos.avg_entry_price == Decimal("0.3500")
+
+
+def test_long_to_short_flip_and_long_round_trip_unchanged() -> None:
+    p = _flat_portfolio()
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.BID, Decimal("10"), Decimal("0.40"), Decimal("0"), 0)
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("10"), Decimal("0.40"), Decimal("0"), 0)
+    assert p.cash_balance_dollars == Decimal("1000.00")
+    assert "T" not in p.positions
+
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.BID, Decimal("4"), Decimal("0.50"), Decimal("0"), 0)
+    ShadowSimulator._apply_fill_to_portfolio(p, "T", OrderSide.ASK, Decimal("10"), Decimal("0.60"), Decimal("0"), 0)
+    pos = p.positions["T"]
+    assert pos.net_contracts == Decimal("-6")
+    assert pos.cost_basis_dollars == Decimal("2.40")  # 6 NO @ $0.40
+    assert pos.avg_entry_price == Decimal("0.6000")

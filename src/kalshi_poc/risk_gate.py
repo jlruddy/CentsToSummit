@@ -18,6 +18,9 @@ from kalshi_poc.simulator import calculate_taker_fee, walk_book
 
 logger = logging.getLogger(__name__)
 ONE = Decimal("1.00")
+# Contracts closing within this window are treated as held to settlement (entry fee only).
+HOLD_TO_EXPIRY_MAX_SECONDS = 7200.0
+HOLD_TO_EXPIRY_MIN_NET_EDGE = Decimal("0.015")
 
 
 def extract_series_prefix(ticker: str) -> str:
@@ -101,23 +104,49 @@ class RiskGate:
         snapshot: OrderbookSnapshot | None,
         portfolio: PortfolioState,
         now_ms: int | None = None,
+        *,
+        seconds_to_expiry: float | None = None,
+        emergency_exit: bool = False,
     ) -> RiskEvaluation:
+        """Deterministically approve/reject `intent`.
+
+        `seconds_to_expiry` comes from the exchange's market close_time. Single-leg (entry-only)
+        fee accounting applies only when it is known and <= HOLD_TO_EXPIRY_MAX_SECONDS; the
+        AI's own `hold_to_expiry` flag is recorded but never loosens any threshold.
+
+        `emergency_exit=True` (operator Emergency Flatten only) lifts the slippage bands for
+        risk-reducing exits so a wide book cannot trap a position; depth checks still apply.
+        """
         ts = now_ms if now_ms is not None else int(time.time() * 1000)
         s = self._settings
         reasons: list[str] = []
 
-        # 1. Kill-switch & daily drawdown check
+        # 0. Classify risk-reducing exits first: they must stay possible after the kill-switch trips
+        existing_pos = portfolio.positions.get(intent.ticker)
+        is_reducing_exit = (
+            existing_pos is not None
+            and existing_pos.net_contracts != Decimal("0")
+            and intent.count <= abs(existing_pos.net_contracts)
+            and (
+                (existing_pos.net_contracts > Decimal("0") and intent.side == OrderSide.ASK)
+                or (existing_pos.net_contracts < Decimal("0") and intent.side == OrderSide.BID)
+            )
+        )
+
+        # 1. Kill-switch & daily drawdown check (trips for everyone; blocks only new risk)
         self.daily_loss = max(Decimal("0.00"), -portfolio.daily_pnl_dollars)
         if portfolio.kill_switch_tripped or self.kill_switch_tripped:
             self.kill_switch_tripped = True
             portfolio.kill_switch_tripped = True
-            reasons.append("Kill-switch is tripped")
+            if not is_reducing_exit:
+                reasons.append("Kill-switch is tripped")
         if portfolio.daily_pnl_dollars <= -s.daily_drawdown_kill_switch:
             self.kill_switch_tripped = True
             portfolio.kill_switch_tripped = True
-            reasons.append(
-                f"Daily drawdown kill-switch breached ({portfolio.daily_pnl_dollars:.2f} <= -{s.daily_drawdown_kill_switch:.2f})"
-            )
+            if not is_reducing_exit:
+                reasons.append(
+                    f"Daily drawdown kill-switch breached ({portfolio.daily_pnl_dollars:.2f} <= -{s.daily_drawdown_kill_switch:.2f})"
+                )
 
         # 2. Tax-Hygiene Allowlist
         series_prefix = extract_series_prefix(intent.ticker)
@@ -136,7 +165,7 @@ class RiskGate:
             t for t in portfolio.recent_order_timestamps_ms if t >= one_minute_ago
         ]
         recent_orders = self.orders_this_minute
-        if len(recent_orders) >= s.max_orders_per_minute:
+        if not is_reducing_exit and len(recent_orders) >= s.max_orders_per_minute:
             reasons.append(
                 f"Order rate limit reached ({len(recent_orders)}/{s.max_orders_per_minute} per min)"
             )
@@ -145,16 +174,6 @@ class RiskGate:
             k for k, pos in portfolio.positions.items() if pos.net_contracts != Decimal("0")
         } | set(portfolio.resting_order_tickers)
 
-        existing_pos = portfolio.positions.get(intent.ticker)
-        is_reducing_exit = (
-            existing_pos is not None
-            and existing_pos.net_contracts != Decimal("0")
-            and intent.count <= abs(existing_pos.net_contracts)
-            and (
-                (existing_pos.net_contracts > Decimal("0") and intent.side == OrderSide.ASK)
-                or (existing_pos.net_contracts < Decimal("0") and intent.side == OrderSide.BID)
-            )
-        )
         if not is_reducing_exit and intent.ticker not in active_tickers and len(active_tickers) >= s.max_open_markets:
             reasons.append(
                 f"Max open markets reached ({len(active_tickers)}/{s.max_open_markets})"
@@ -213,7 +232,10 @@ class RiskGate:
                 f"Orderbook for {intent.ticker} is one-sided or empty (bid={snapshot.best_yes_bid}, ask={snapshot.best_yes_ask})"
             )
         else:
-            if intent.side == OrderSide.BID and (
+            skip_slippage_bands = emergency_exit and is_reducing_exit
+            if skip_slippage_bands:
+                pass
+            elif intent.side == OrderSide.BID and (
                 snapshot.best_yes_ask - intent.limit_price
             ) > max_slip_dollars:
                 reasons.append(
@@ -239,18 +261,19 @@ class RiskGate:
                 entry_fee = calculate_taker_fee(intent.count, est_fill_price)
                 round_trip_fee = entry_fee * Decimal("2")
 
-                if walk.slippage_cents_per_contract > s.max_slippage_cents:
+                if (
+                    not skip_slippage_bands
+                    and walk.slippage_cents_per_contract > s.max_slippage_cents
+                ):
                     reasons.append(
                         f"Estimated slippage {walk.slippage_cents_per_contract}c exceeds max {s.max_slippage_cents}c"
                     )
 
                 if not is_reducing_exit:
-                    is_intraday_binary = (
-                        series_prefix.endswith("15M")
-                        or series_prefix.endswith("D")
-                        or series_prefix.endswith("U")
+                    hold_to_expiry_eligible = (
+                        seconds_to_expiry is not None
+                        and 0.0 < seconds_to_expiry <= HOLD_TO_EXPIRY_MAX_SECONDS
                     )
-                    hold_to_expiry_eligible = intent.hold_to_expiry or is_intraday_binary
                     primary_fee = entry_fee if hold_to_expiry_eligible else round_trip_fee
 
                     total_order_cost = (
@@ -266,28 +289,19 @@ class RiskGate:
                             f"Fee-to-notional ratio {fee_pct}% exceeds 15.0% max (${primary_fee:.2f} / ${total_order_cost:.2f})"
                         )
 
-                    # Normalize both sides of net edge comparison strictly to per-contract dollars
+                    # Strict per-contract units: expected_edge_dollars is always the order total
+                    # (TradeIntent contract); MIN_NET_EDGE_DOLLARS is always per contract.
                     if intent.expected_edge_per_contract is not None:
                         gross_edge_per_c = intent.expected_edge_per_contract
-                        min_net_edge_per_c = (
-                            min(s.min_net_edge_dollars, Decimal("0.015"))
-                            if hold_to_expiry_eligible
-                            else s.min_net_edge_dollars
-                        )
-                    elif intent.count > Decimal("1") and intent.expected_edge_dollars <= Decimal("0.20"):
-                        gross_edge_per_c = intent.expected_edge_dollars
-                        min_net_edge_per_c = (
-                            min(s.min_net_edge_dollars, Decimal("0.015"))
-                            if hold_to_expiry_eligible
-                            else s.min_net_edge_dollars
-                        )
                     else:
                         gross_edge_per_c = (intent.expected_edge_dollars / intent.count).quantize(
                             Decimal("0.0001")
                         )
-                        min_net_edge_per_c = (s.min_net_edge_dollars / intent.count).quantize(
-                            Decimal("0.0001")
-                        )
+                    min_net_edge_per_c = (
+                        min(s.min_net_edge_dollars, HOLD_TO_EXPIRY_MIN_NET_EDGE)
+                        if hold_to_expiry_eligible
+                        else s.min_net_edge_dollars
+                    )
 
                     fee_per_c = (primary_fee / intent.count).quantize(Decimal("0.0001"))
                     slip_per_c = (est_slippage / intent.count).quantize(Decimal("0.0001"))

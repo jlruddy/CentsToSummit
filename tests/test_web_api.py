@@ -33,7 +33,7 @@ def test_config_persistence_and_masked_secrets(tmp_path: Path) -> None:
     cfg_mgr.update_and_persist({"strategy_provider": "stub_momentum"})
     telem = TelemetryManager(tmp_path / "telem.db")
     app = create_app(config_manager=cfg_mgr, telemetry=telem)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:8000")
 
     pem = _ed25519_pem()
     save_resp = client.post(
@@ -70,7 +70,7 @@ def test_inline_credentials_test_endpoint(tmp_path: Path) -> None:
     cfg_mgr.update_and_persist({"strategy_provider": "stub_momentum"})
     telem = TelemetryManager(tmp_path / "telem.db")
     app = create_app(config_manager=cfg_mgr, telemetry=telem)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:8000")
 
     pem = _ed25519_pem()
     mock_bal = BalanceResponse(
@@ -124,7 +124,7 @@ def test_hot_reload_initial_capital_updates_cash_and_budget(tmp_path: Path) -> N
     telem = TelemetryManager(tmp_path / "telem.db")
     engine = TradingEngine(cfg_mgr, telem)
     app = create_app(config_manager=cfg_mgr, telemetry=telem, engine=engine)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:8000")
 
     resp = client.post(
         "/api/config",
@@ -303,7 +303,7 @@ def test_eval_now_emits_hold_ai_decision_and_derived_yes_asks(tmp_path: Path) ->
     q = telem.subscribe()
 
     app = create_app(config_manager=cfg_mgr, telemetry=telem, engine=engine)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:8000")
     resp = client.post("/api/engine/eval-now")
     assert resp.status_code == 200
     assert resp.json()["evaluated"] == 1
@@ -395,7 +395,7 @@ async def test_reset_shadow_clears_kill_switch_flattens_and_rotates_session(tmp_
     old_session = telem.session_id
 
     app = create_app(config_manager=cfg_mgr, telemetry=telem, engine=engine)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:8000")
     try:
         resp = client.post("/api/engine/reset-shadow")
 
@@ -482,7 +482,7 @@ async def test_execution_error_surfaced_and_demo_prod_mismatch_blocked(tmp_path:
         # Environment mismatch: demo mode + production environment blocked on start_engine
         cfg_mgr.update_and_persist({"kalshi_environment": "production", "execution_mode": "demo"})
         app = create_app(config_manager=cfg_mgr, telemetry=telem, engine=engine)
-        client = TestClient(app)
+        client = TestClient(app, base_url="http://127.0.0.1:8000")
         resp = client.post("/api/engine/start")
         assert resp.status_code == 400
         assert "demo" in resp.json()["detail"]
@@ -578,8 +578,8 @@ async def test_ws_telemetry_hydrates_recent_history_on_connect(tmp_path: Path) -
             )
         )
         app = create_app(config_manager=cfg_mgr, telemetry=telem)
-        client = TestClient(app)
-        with client.websocket_connect("/ws/telemetry") as ws:
+        client = TestClient(app, base_url="http://127.0.0.1:8000")
+        with client.websocket_connect("ws://127.0.0.1:8000/ws/telemetry") as ws:
             msg1 = ws.receive_json()
             msg2 = ws.receive_json()
         assert msg1["type"] == "STATUS"
@@ -763,6 +763,10 @@ async def test_v2_order_endpoints_cancellation_and_fill_reconciliation(tmp_path:
             rationale="V2 fill test",
             provider="stub_momentum",
         )
+        from datetime import datetime, timedelta, timezone
+
+        # Hourly KXBTCD contract closing in 30 min -> single-leg fee eligibility from close_time
+        engine._market_expiries["KXBTCD-TEST"] = datetime.now(timezone.utc) + timedelta(minutes=30)
         v2_fill_resp = {
             "order_id": "v2-ord-999",
             "fill_count": "4",
@@ -1094,6 +1098,7 @@ async def test_portfolio_sync_drops_expired_positions_reaps_resting_orders_and_s
         env_path=tmp_path / ".env",
         config_json_path=tmp_path / "config.json",
         key_dir=tmp_path / "keys",
+        allow_live=True,
     )
     cfg_mgr.update_and_persist(
         {
@@ -1164,6 +1169,7 @@ async def test_portfolio_sync_drops_expired_positions_reaps_resting_orders_and_s
                     return_value=[
                         {
                             "order_id": "stale-ord-1",
+                            "client_order_id": "c2s-stale-ord-1",
                             "ticker": "KXETHD-STALE",
                             "remaining_count_fp": "2",
                             "price_dollars": "0.45",
@@ -1268,6 +1274,7 @@ async def test_bidirectional_shard_transfer_dynamic_sizing_and_per_contract_edge
         env_path=tmp_path / ".env",
         config_json_path=tmp_path / "config.json",
         key_dir=tmp_path / "keys",
+        allow_live=True,
     )
     cfg_mgr.update_and_persist(
         {
@@ -1483,3 +1490,25 @@ async def test_open_position_subscription_retention_deterministic_exits_and_2h_d
     finally:
         await telem.close()
 
+
+
+def test_env_file_values_are_quoted_against_line_injection(tmp_path: Path) -> None:
+    from kalshi_poc.config import AppSettings
+
+    cfg_mgr = ConfigManager(
+        env_path=tmp_path / ".env",
+        config_json_path=tmp_path / "config.json",
+        key_dir=tmp_path / "keys",
+    )
+    cfg_mgr.update_and_persist(
+        {
+            "kalshi_api_key_id": "abc\nEXECUTION_MODE=live",
+            "llm_endpoint": "http://h/x #not-a-comment",
+            "system_prompt_override": 'He said "hi"\nline2',
+        }
+    )
+    reloaded = AppSettings(_env_file=tmp_path / ".env")
+    assert reloaded.execution_mode.value == "paused"
+    assert reloaded.kalshi_api_key_id == "abc\nEXECUTION_MODE=live"
+    assert reloaded.llm_endpoint == "http://h/x #not-a-comment"
+    assert reloaded.system_prompt_override == 'He said "hi"\nline2'

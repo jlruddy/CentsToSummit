@@ -7,9 +7,10 @@ import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from kalshi_poc.auth import KalshiSigner, load_private_key, load_private_key_from_path
@@ -19,6 +20,33 @@ from kalshi_poc.models import Environment, ExecutionMode
 from kalshi_poc.telemetry import TelemetryManager, export_parquet_zip
 
 STATIC_DIR = Path(__file__).parent / "static"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _hostname(value: str) -> str | None:
+    """Extract a lowercase hostname from a Host header or Origin URL (None if unparsable)."""
+    value = value.strip()
+    if not value or value == "null":
+        return None
+    try:
+        parts = urlsplit(value if "://" in value else f"//{value}")
+        return parts.hostname.lower() if parts.hostname else None
+    except ValueError:
+        return None
+
+
+def is_allowed_host(host_header: str, extra_hosts: list[str]) -> bool:
+    name = _hostname(host_header)
+    return name is not None and (name in LOOPBACK_HOSTS or name in extra_hosts)
+
+
+def is_allowed_origin(origin: str | None, extra_hosts: list[str]) -> bool:
+    """Missing Origin (curl, scripts) is allowed; any present Origin must be an allowed host."""
+    if origin is None:
+        return True
+    name = _hostname(origin)
+    return name is not None and (name in LOOPBACK_HOSTS or name in extra_hosts)
 
 
 class EngineController(Protocol):
@@ -59,6 +87,18 @@ def create_app(
     app.state.engine = engine
     app.state.last_cred_test_monotonic = 0.0
     app.state.cred_test_lock = asyncio.Lock()
+
+    @app.middleware("http")
+    async def host_and_origin_guard(request: Request, call_next: Any) -> Any:
+        """Block DNS-rebinding (Host) and cross-site requests (Origin) to the control panel."""
+        extra = app.state.config_manager.settings.web_allowed_hosts
+        if not is_allowed_host(request.headers.get("host", ""), extra):
+            return JSONResponse({"detail": "Host not allowed"}, status_code=403)
+        if request.method not in SAFE_METHODS and not is_allowed_origin(
+            request.headers.get("origin"), extra
+        ):
+            return JSONResponse({"detail": "Cross-origin request blocked"}, status_code=403)
+        return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
     async def serve_index() -> HTMLResponse:
@@ -249,6 +289,12 @@ def create_app(
 
     @app.websocket("/ws/telemetry")
     async def ws_telemetry(websocket: WebSocket) -> None:
+        extra = app.state.config_manager.settings.web_allowed_hosts
+        if not is_allowed_host(websocket.headers.get("host", ""), extra) or not is_allowed_origin(
+            websocket.headers.get("origin"), extra
+        ):
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         q = app.state.telemetry.subscribe()
         try:

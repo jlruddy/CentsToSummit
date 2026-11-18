@@ -21,6 +21,7 @@ from kalshi_poc.auth import KalshiSigner
 from kalshi_poc.client import KalshiApiError, KalshiRestClient, KalshiWebSocketClient
 from kalshi_poc.config import AppSettings, ConfigManager
 from kalshi_poc.models import (
+    CLIENT_ORDER_ID_PREFIX,
     Environment,
     ExecutionMode,
     ExecutionRecord,
@@ -32,7 +33,12 @@ from kalshi_poc.models import (
     V2CreateOrderRequest,
 )
 from kalshi_poc.risk_gate import RiskGate
-from kalshi_poc.simulator import ShadowSimulator, calculate_taker_fee, walk_book
+from kalshi_poc.simulator import (
+    ShadowSimulator,
+    calculate_maker_fee,
+    calculate_taker_fee,
+    walk_book,
+)
 from kalshi_poc.strategy_ai import BaseStrategy, StrategyFactory
 from kalshi_poc.telemetry import TelemetryManager, export_sqlite_to_parquet
 from kalshi_poc.web_server import create_app
@@ -44,6 +50,8 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("kalshi_poc")
+
+EXIT_RETRY_INTERVAL_SEC = 3.0
 
 
 class TradingEngine:
@@ -85,6 +93,18 @@ class TradingEngine:
         self._resting_order_first_seen: dict[str, float] = {}
         self._initial_sync_done: bool = False
         self._funded_shards: set[int] = set()
+        # Single-application fill ledger (H8): quantities per order_id from each source
+        self._fills_applied: dict[str, Decimal] = {}
+        self._fills_rest: dict[str, Decimal] = {}
+        self._fills_ws: dict[str, Decimal] = {}
+        self._seen_trade_ids: set[str] = set()
+        self._seen_trade_order: deque[str] = deque(maxlen=20_000)
+        self._own_order_ids: set[str] = set()
+        # C4/H6: exit management while paused/killed, exit throttling, persisted risk state
+        self._exit_mode_when_paused: ExecutionMode | None = None
+        self._last_exit_attempt_mono: dict[str, float] = {}
+        self._persisted_kill_switch: bool | None = None
+        self._baseline_key: tuple[str, str] | None = None
         self._engine_lock = asyncio.Lock()
         self._sync_lock = asyncio.Lock()
         self.session_start_ts: int = int(time.time() * 1000)
@@ -109,6 +129,157 @@ class TradingEngine:
             return "XRP"
         return raw
 
+    def _effective_mode(self, s: AppSettings | None = None) -> ExecutionMode:
+        """Active mode, or the last active mode when PAUSED (used to route exits and syncs)."""
+        s = s or self.config_manager.settings
+        if s.execution_mode != ExecutionMode.PAUSED:
+            return s.execution_mode
+        return self._last_mode_before_pause
+
+    def _is_exchange_scope(self, s: AppSettings | None = None) -> bool:
+        return self._effective_mode(s) in (ExecutionMode.DEMO, ExecutionMode.LIVE)
+
+    def _apply_order_fill(
+        self,
+        order_id: str,
+        ticker: str,
+        side: OrderSide,
+        qty: Decimal,
+        price: Decimal,
+        *,
+        source: str,
+        fee_total: Decimal | None,
+        ts_ms: int,
+        is_maker: bool = False,
+    ) -> Decimal:
+        """Apply only the not-yet-applied fill quantity for `order_id` (REST or WS, any order).
+
+        REST reports a cumulative fill count for the order; WS reports one trade at a time.
+        The portfolio is moved to max(REST cumulative, WS sum), so each contract counts once.
+        Returns the quantity newly applied.
+        """
+        if qty <= Decimal("0"):
+            return Decimal("0")
+        if source == "rest":
+            self._fills_rest[order_id] = max(self._fills_rest.get(order_id, Decimal("0")), qty)
+        else:
+            self._fills_ws[order_id] = self._fills_ws.get(order_id, Decimal("0")) + qty
+        target = max(
+            self._fills_rest.get(order_id, Decimal("0")),
+            self._fills_ws.get(order_id, Decimal("0")),
+        )
+        delta = target - self._fills_applied.get(order_id, Decimal("0"))
+        if delta <= Decimal("0"):
+            return Decimal("0")
+        if fee_total is not None:
+            fee = (fee_total * delta / qty).quantize(Decimal("0.01")) if delta != qty else fee_total
+        else:
+            fee = (
+                calculate_maker_fee(delta, price) if is_maker else calculate_taker_fee(delta, price)
+            )
+        self.simulator._apply_fill_to_portfolio(
+            self.portfolio, ticker, side, delta, price, fee, ts_ms
+        )
+        self._fills_applied[order_id] = target
+        return delta
+
+    @staticmethod
+    def _fill_direction(msg: dict[str, Any]) -> OrderSide:
+        """Map Kalshi fill (side, action) to the YES-leg direction of the trade."""
+        side_raw = str(msg.get("side") or "yes").lower()
+        action = str(msg.get("action") or "buy").lower()
+        if side_raw in ("bid", "ask"):
+            return OrderSide(side_raw)
+        buys_yes = (side_raw == "yes") == (action == "buy")
+        return OrderSide.BID if buys_yes else OrderSide.ASK
+
+    @staticmethod
+    def _fill_yes_price(msg: dict[str, Any]) -> Decimal:
+        raw = msg.get("yes_price_dollars") or msg.get("price_dollars") or msg.get("yes_price")
+        if raw is None:
+            no_raw = msg.get("no_price_dollars") or msg.get("no_price")
+            if no_raw is not None:
+                no_px = Decimal(str(no_raw))
+                if no_px > Decimal("1"):
+                    no_px = no_px / Decimal("100")
+                return (Decimal("1.00") - no_px).quantize(Decimal("0.0001"))
+            raw = "0.50"
+        px = Decimal(str(raw))
+        if px > Decimal("1"):
+            px = px / Decimal("100")
+        return px.quantize(Decimal("0.0001"))
+
+    def _risk_scope(self, s: AppSettings | None = None) -> str:
+        """Daily-baseline scope: shadow capital and exchange capital are tracked separately."""
+        s = s or self.config_manager.settings
+        if self._effective_mode(s) == ExecutionMode.SHADOW:
+            return "shadow"
+        return f"exchange:{s.kalshi_environment.value}"
+
+    async def _persist_kill_state(self, tripped: bool) -> None:
+        await self.telemetry.save_state(
+            "kill_switch", {"tripped": tripped, "ts_ms": int(time.time() * 1000)}
+        )
+        self._persisted_kill_switch = tripped
+
+    async def _persist_kill_state_if_changed(self) -> None:
+        if self._persisted_kill_switch != self.portfolio.kill_switch_tripped:
+            await self._persist_kill_state(self.portfolio.kill_switch_tripped)
+
+    async def _save_daily_baseline(self, scope: str, day: str) -> None:
+        await self.telemetry.save_state(
+            f"daily_baseline:{scope}",
+            {"date": day, "equity": str(self.portfolio.daily_start_equity_dollars)},
+        )
+        self._baseline_key = (day, scope)
+
+    async def _load_persisted_state(self) -> None:
+        """Restore kill-switch and last active mode so a restart never silently resets risk state."""
+        kill = await self.telemetry.load_state("kill_switch")
+        tripped = bool(kill and kill.get("tripped"))
+        if tripped:
+            self.portfolio.kill_switch_tripped = True
+            self.risk_gate.kill_switch_tripped = True
+            logger.warning("[RISK] Kill-switch restored as TRIPPED from persisted state; press Start to clear.")
+        self._persisted_kill_switch = tripped
+
+        s = self.config_manager.settings
+        last = await self.telemetry.load_state("last_active_mode")
+        if last and s.execution_mode == ExecutionMode.PAUSED:
+            try:
+                mode = ExecutionMode(str(last.get("mode")))
+            except ValueError:
+                mode = ExecutionMode.PAUSED
+            if mode != ExecutionMode.PAUSED:
+                self._last_mode_before_pause = mode
+
+    async def _ensure_daily_baseline(self, s: AppSettings, now_utc: datetime) -> None:
+        """Keep one daily drawdown baseline per UTC day and scope, surviving restarts."""
+        day = now_utc.date().isoformat()
+        scope = self._risk_scope(s)
+        if self._baseline_key == (day, scope):
+            return
+        if (
+            scope != "shadow"
+            and self.rest_client is not None
+            and self.rest_client.signer is not None
+            and not self._initial_sync_done
+        ):
+            return  # wait for the real exchange equity before fixing the baseline
+        stored = await self.telemetry.load_state(f"daily_baseline:{scope}")
+        if stored and stored.get("date") == day:
+            self.portfolio.daily_start_equity_dollars = Decimal(str(stored["equity"]))
+            self._baseline_key = (day, scope)
+            return
+        self.portfolio.daily_start_equity_dollars = self.portfolio.current_equity_dollars
+        await self._save_daily_baseline(scope, day)
+        logger.info(
+            "[RISK] Daily drawdown baseline set to $%s for %s (%s UTC)",
+            self.portfolio.daily_start_equity_dollars,
+            scope,
+            day,
+        )
+
     def _build_signer(self, s: AppSettings) -> KalshiSigner | None:
         if not s.kalshi_api_key_id.strip():
             return None
@@ -125,7 +296,11 @@ class TradingEngine:
         """Hot-reload RiskGate, Strategy, and Portfolio without dropping active WebSocket feeds."""
         logger.info("Hot-reloading RiskGate and Strategy parameters...")
         self.risk_gate.update_settings(new_s)
-        self.strategy = StrategyFactory.create(new_s)
+        if old_s.strategy_provider != new_s.strategy_provider:
+            self.strategy = StrategyFactory.create(new_s)
+        else:
+            # Keep rolling mid-price buffers, LLM cooldown and single-flight lock across saves
+            self.strategy.settings = new_s
 
         env_changed = old_s.kalshi_environment != new_s.kalshi_environment
         creds_changed = (
@@ -151,6 +326,13 @@ class TradingEngine:
             self.portfolio.cash_balance_dollars = new_s.initial_capital
             self.portfolio.starting_capital_dollars = new_s.initial_capital
             self.portfolio.daily_start_equity_dollars = new_s.initial_capital
+            capital_reset = True
+        else:
+            capital_reset = False
+
+        if new_s.execution_mode != ExecutionMode.PAUSED:
+            self._last_mode_before_pause = new_s.execution_mode
+            self._exit_mode_when_paused = None
 
         try:
             loop = asyncio.get_running_loop()
@@ -158,6 +340,18 @@ class TradingEngine:
             loop = None
 
         if loop is not None:
+            if new_s.execution_mode != ExecutionMode.PAUSED and mode_changed:
+                loop.create_task(
+                    self.telemetry.save_state(
+                        "last_active_mode", {"mode": new_s.execution_mode.value}
+                    )
+                )
+            if capital_reset:
+                loop.create_task(
+                    self._save_daily_baseline(
+                        self._risk_scope(new_s), datetime.now(timezone.utc).date().isoformat()
+                    )
+                )
             should_sync_api_balance = (
                 new_s.execution_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE)
                 and (mode_changed or creds_changed or env_changed)
@@ -222,7 +416,9 @@ class TradingEngine:
                 except Exception:
                     pass
 
-            if age_sec > 20.0 and oid:
+            client_oid = str(o.get("client_order_id") or "")
+            is_own = client_oid.startswith(CLIENT_ORDER_ID_PREFIX) or oid in self._own_order_ids
+            if age_sec > 20.0 and oid and is_own:
                 try:
                     await self.rest_client.cancel_order(oid, market_ticker=ticker or None)
                     logger.info(
@@ -274,6 +470,9 @@ class TradingEngine:
     async def sync_balance_from_api(self) -> None:
         """Sync portfolio cash_balance and active non-expired positions from Kalshi API."""
         if self.rest_client is None or self.rest_client.signer is None or self._sync_lock.locked():
+            return
+        if not self._is_exchange_scope():
+            # M2: shadow capital/positions are never overwritten by the real exchange account
             return
         async with self._sync_lock:
             await self._sync_balance_from_api_locked()
@@ -373,7 +572,8 @@ class TradingEngine:
             if not self._initial_sync_done:
                 self._initial_sync_done = True
                 self.portfolio.starting_capital_dollars = self.portfolio.current_equity_dollars
-                self.portfolio.daily_start_equity_dollars = self.portfolio.current_equity_dollars
+                # Fix today's drawdown baseline from real exchange equity before any evaluation
+                await self._ensure_daily_baseline(self.config_manager.settings, now_utc)
 
             logger.info(
                 "Synced Kalshi balance: $%s (equity=$%s, open_markets=%d, resting_orders=%d, shards=%s)",
@@ -482,8 +682,8 @@ class TradingEngine:
             on_fill=self._on_fill,
         )
 
-        # Fresh session startup: never inherit a tripped kill-switch; sync starting balance from API if configured
-        self.portfolio.kill_switch_tripped = False
+        # Restore persisted kill-switch / last active mode; sync starting balance from API if configured
+        await self._load_persisted_state()
         if signer is not None:
             await self.sync_balance_from_api()
 
@@ -644,26 +844,46 @@ class TradingEngine:
         await self.telemetry.log_orderbook(snap)
 
     async def _on_fill(self, msg: dict[str, Any]) -> None:
-        """Track live cash/position changes via private fill WebSocket channel."""
+        """Track live fills from the private WS channel, applying each contract exactly once."""
         logger.info("Received live fill event: %s", msg)
         ts_ms = int(time.time() * 1000)
-        ticker = msg.get("market_ticker") or msg.get("ticker") or "UNKNOWN"
-        side_raw = msg.get("side", "yes")
-        side = OrderSide.BID if side_raw in ("yes", "bid") else OrderSide.ASK
-        count = Decimal(str(msg.get("count_fp") or msg.get("count") or "0"))
-        price_raw = msg.get("yes_price_dollars") or msg.get("price_dollars") or msg.get("yes_price") or "0.50"
-        price = Decimal(str(price_raw))
-        if price > Decimal("1"):
-            price = price / Decimal("100")
+        ticker = str(msg.get("market_ticker") or msg.get("ticker") or "UNKNOWN")
+        trade_id = str(msg.get("trade_id") or "")
+        order_id = str(msg.get("order_id") or (f"trade-{trade_id}" if trade_id else ""))
+        await self.telemetry.log_exchange_event(
+            "fill", msg, ticker=ticker, order_id=order_id, trade_id=trade_id, timestamp_ms=ts_ms
+        )
 
-        if count > Decimal("0"):
-            fee = calculate_taker_fee(count, price)
-            self.simulator._apply_fill_to_portfolio(
-                self.portfolio, ticker, side, count, price, fee, ts_ms
-            )
-            if self.rest_client is not None:
-                await self.rest_client.upgrade_api_tier_once()
-                await self.sync_balance_from_api()
+        if not self._is_exchange_scope():
+            logger.info("[FILL] Ignoring exchange fill in shadow scope (ticker=%s)", ticker)
+            return
+        if trade_id:
+            if trade_id in self._seen_trade_ids:
+                return
+            if len(self._seen_trade_order) == self._seen_trade_order.maxlen:
+                self._seen_trade_ids.discard(self._seen_trade_order[0])
+            self._seen_trade_order.append(trade_id)
+            self._seen_trade_ids.add(trade_id)
+        if not order_id:
+            return
+
+        count = Decimal(str(msg.get("count_fp") or msg.get("count") or "0"))
+        price = self._fill_yes_price(msg)
+        is_maker = msg.get("is_taker") is False
+        applied = self._apply_order_fill(
+            order_id,
+            ticker,
+            self._fill_direction(msg),
+            count,
+            price,
+            source="ws",
+            fee_total=None,
+            ts_ms=ts_ms,
+            is_maker=is_maker,
+        )
+        if applied > Decimal("0") and self.rest_client is not None:
+            await self.rest_client.upgrade_api_tier_once()
+            await self.sync_balance_from_api()
 
     async def _evict_unhealthy_subscriptions(
         self, s: AppSettings, now_utc: datetime, now_mono: float | None = None
@@ -745,7 +965,7 @@ class TradingEngine:
 
                 # Never count expired contracts toward Max Open Markets
                 expired_cleared = False
-                if s.execution_mode != ExecutionMode.SHADOW and self.portfolio.positions:
+                if self._is_exchange_scope(s) and self.portfolio.positions:
                     for t in list(self.portfolio.positions.keys()):
                         exp = self._market_expiries.get(t)
                         if exp is not None and exp <= now_utc:
@@ -757,7 +977,7 @@ class TradingEngine:
                 if (
                     self.rest_client is not None
                     and self.rest_client.signer is not None
-                    and s.execution_mode != ExecutionMode.SHADOW
+                    and self._is_exchange_scope(s)
                 ):
                     if (
                         expired_cleared
@@ -807,9 +1027,11 @@ class TradingEngine:
                 ):
                     await self._refresh_subscriptions(s)
 
+                await self._ensure_daily_baseline(s, now_utc)
+
                 async with self._engine_lock:
                     if (
-                        s.execution_mode == ExecutionMode.SHADOW
+                        self._effective_mode(s) == ExecutionMode.SHADOW
                         and self.ws_client is not None
                         and self.portfolio.positions
                     ):
@@ -823,12 +1045,15 @@ class TradingEngine:
                             self._market_expiries.pop(rec.ticker, None)
                             await self.telemetry.log_execution(rec)
 
+                    # Exit management runs even when the kill-switch is tripped or the engine
+                    # was paused mid-session; only new entries are gated on mode + kill-switch.
+                    if self.ws_client is not None:
+                        await self._run_exit_management(s, now_utc)
                     if (
                         s.execution_mode != ExecutionMode.PAUSED
                         and not self.portfolio.kill_switch_tripped
                         and self.ws_client is not None
                     ):
-                        await self._evaluate_deterministic_exits(s, now_utc)
                         active_snapshots: list[OrderbookSnapshot] = []
                         stale_tickers: list[str] = []
                         for snap in list(self.ws_client.orderbooks.values()):
@@ -860,6 +1085,7 @@ class TradingEngine:
                     self.equity_history.append(eq_point)
                     await self.telemetry.log_equity(self.portfolio, str(s.equity_floor), ts_ms)
                     await self.telemetry.broadcast("STATUS", self.get_status())
+                await self._persist_kill_state_if_changed()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -867,8 +1093,20 @@ class TradingEngine:
 
             await asyncio.sleep(s.poll_interval_ms / 1000.0)
 
+    async def _run_exit_management(self, s: AppSettings, now_utc: datetime) -> list[TradeIntent]:
+        """Manage open-position exits in the active mode, or the mode active before a pause/kill."""
+        if not self.portfolio.positions:
+            return []
+        if s.execution_mode != ExecutionMode.PAUSED:
+            mode = s.execution_mode
+        elif self._exit_mode_when_paused is not None:
+            mode = self._exit_mode_when_paused
+        else:
+            return []  # paused since boot: never act on positions until the operator starts
+        return await self._evaluate_deterministic_exits(s, now_utc, mode=mode)
+
     async def _evaluate_deterministic_exits(
-        self, s: AppSettings, now_utc: datetime
+        self, s: AppSettings, now_utc: datetime, mode: ExecutionMode | None = None
     ) -> list[TradeIntent]:
         """Evaluate open positions every 1s for Take-Profit Lock or Hard Stop-Loss exits."""
         if self.ws_client is None or not self.portfolio.positions:
@@ -916,6 +1154,11 @@ class TradingEngine:
 
             if not (take_profit or stop_loss):
                 continue
+            now_mono = time.monotonic()
+            last_try = self._last_exit_attempt_mono.get(ticker)
+            if last_try is not None and (now_mono - last_try) < EXIT_RETRY_INTERVAL_SEC:
+                continue
+            self._last_exit_attempt_mono[ticker] = now_mono
 
             limit_px = min(Decimal("0.9900"), max(Decimal("0.0100"), raw_exit_px))
             walk = walk_book(snap, exit_side, abs(pos.net_contracts), limit_price=limit_px)
@@ -959,8 +1202,11 @@ class TradingEngine:
             d["prompt_tokens"] = 0
             d["completion_tokens"] = 0
             d["estimated_cost_usd"] = "0.000000"
+            d["decision_status"] = "DETERMINISTIC_EXIT"
             await self.telemetry.log_ai_decision(d)
-            await self._evaluate_and_execute_intent(intent, snap, s, execute_orders=True)
+            await self._evaluate_and_execute_intent(
+                intent, snap, s, execute_orders=True, mode=mode
+            )
             submitted.append(intent)
 
         return submitted
@@ -996,6 +1242,8 @@ class TradingEngine:
             positions_by_ticker=self.portfolio.positions,
             force=force,
         )
+        if batch.llm_call is not None:
+            await self.telemetry.log_llm_call(batch.llm_call)
         is_gated_hold = not batch.invoked_llm and not batch.intents and not force
         if is_gated_hold:
             now_mono = time.monotonic()
@@ -1030,7 +1278,10 @@ class TradingEngine:
         snap: OrderbookSnapshot,
         s: AppSettings,
         execute_orders: bool = True,
+        mode: ExecutionMode | None = None,
+        emergency: bool = False,
     ) -> None:
+        route = mode or s.execution_mode
         max_slip_dollars = (s.max_slippage_cents / Decimal("100")).quantize(Decimal("0.0001"))
         if snap.best_yes_bid is not None and snap.best_yes_ask is not None:
             if intent.side == OrderSide.BID:
@@ -1052,26 +1303,38 @@ class TradingEngine:
                     if clamped_px != intent.limit_price:
                         intent = intent.model_copy(update={"limit_price": clamped_px})
 
-        evaluation = self.risk_gate.evaluate(intent, snap, self.portfolio)
+        exp = self._market_expiries.get(intent.ticker)
+        if exp is None and self.rest_client is not None:
+            exp = self.rest_client.market_expiries.get(intent.ticker)
+        seconds_to_expiry = (
+            (exp - datetime.now(timezone.utc)).total_seconds() if exp is not None else None
+        )
+        evaluation = self.risk_gate.evaluate(
+            intent,
+            snap,
+            self.portfolio,
+            seconds_to_expiry=seconds_to_expiry,
+            emergency_exit=emergency,
+        )
         await self.telemetry.log_risk_evaluation(evaluation)
 
         if not evaluation.approved or not execute_orders:
             return
 
-        if s.execution_mode == ExecutionMode.SHADOW:
+        if route == ExecutionMode.SHADOW:
             rec = self.simulator.simulate_fill(
                 intent, snap, portfolio=self.portfolio, mode=ExecutionMode.SHADOW
             )
             await self.telemetry.log_execution(rec)
 
-        elif s.execution_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE):
+        elif route in (ExecutionMode.DEMO, ExecutionMode.LIVE):
             # Record shadow prediction simultaneously for fill-quality calibration
             shadow_rec = self.simulator.simulate_fill(
-                intent, snap, portfolio=None, mode=s.execution_mode
+                intent, snap, portfolio=None, mode=route
             )
             v2_order = V2CreateOrderRequest.from_intent(intent)
 
-            if s.execution_mode == ExecutionMode.DEMO and s.kalshi_environment == Environment.PRODUCTION:
+            if route == ExecutionMode.DEMO and s.kalshi_environment == Environment.PRODUCTION:
                 err = "Environment mismatch: execution_mode=demo cannot run when environment=production."
                 logger.error(err)
                 await self.telemetry.log_execution(
@@ -1080,7 +1343,7 @@ class TradingEngine:
                         client_order_id=v2_order.client_order_id,
                         intent_id=intent.intent_id,
                         ticker=intent.ticker,
-                        mode=s.execution_mode,
+                        mode=route,
                         side=intent.side,
                         count=intent.count,
                         requested_price=intent.limit_price,
@@ -1095,7 +1358,7 @@ class TradingEngine:
                 return
 
             if self.rest_client is None or self.rest_client.signer is None:
-                err = f"Cannot send {s.execution_mode.value} order: Kalshi credentials not configured."
+                err = f"Cannot send {route.value} order: Kalshi credentials not configured."
                 logger.warning(err)
                 await self.telemetry.log_execution(
                     ExecutionRecord(
@@ -1103,7 +1366,7 @@ class TradingEngine:
                         client_order_id=v2_order.client_order_id,
                         intent_id=intent.intent_id,
                         ticker=intent.ticker,
-                        mode=s.execution_mode,
+                        mode=route,
                         side=intent.side,
                         count=intent.count,
                         requested_price=intent.limit_price,
@@ -1193,18 +1456,29 @@ class TradingEngine:
                 )
                 ts_ms = int(order_obj.get("ts_ms") or time.time() * 1000)
 
+                await self.telemetry.log_exchange_event(
+                    "order_response",
+                    resp,
+                    ticker=intent.ticker,
+                    order_id=order_id,
+                    timestamp_ms=ts_ms,
+                )
+                self._own_order_ids.add(order_id)
                 raw_status = str(order_obj.get("status") or "").lower()
                 if fill_count_raw is not None:
                     filled_qty = Decimal(str(fill_count_raw))
-                elif raw_status in ("resting", "pending", "open"):
-                    filled_qty = Decimal("0")
-                else:
+                elif raw_status in ("executed", "filled"):
                     filled_qty = intent.count
-                rem_qty = (
-                    Decimal(str(rem_count_raw))
-                    if rem_count_raw is not None
-                    else (intent.count - filled_qty if filled_qty < intent.count else Decimal("0"))
-                )
+                else:
+                    # Unknown fill quantity: never invent a fill; WS fills / portfolio sync reconcile
+                    filled_qty = Decimal("0")
+                terminal = raw_status in ("canceled", "cancelled", "executed", "filled", "expired")
+                if rem_count_raw is not None:
+                    rem_qty = Decimal(str(rem_count_raw))
+                elif terminal:
+                    rem_qty = Decimal("0")
+                else:
+                    rem_qty = max(Decimal("0"), intent.count - filled_qty)
 
                 # Update in-memory shard balance immediately so back-to-back orders see true available collateral
                 order_shard = await self.rest_client.get_market_exchange_index(intent.ticker)
@@ -1243,14 +1517,15 @@ class TradingEngine:
                     self._resting_order_first_seen[order_id] = time.monotonic()
                     self.portfolio.resting_order_tickers.add(intent.ticker)
                 if filled_qty > Decimal("0") and fill_count_raw is not None:
-                    self.simulator._apply_fill_to_portfolio(
-                        self.portfolio,
+                    self._apply_order_fill(
+                        order_id,
                         intent.ticker,
                         intent.side,
                         filled_qty,
                         actual_fill_price,
-                        actual_fee,
-                        ts_ms,
+                        source="rest",
+                        fee_total=actual_fee,
+                        ts_ms=ts_ms,
                     )
                 await self.rest_client.upgrade_api_tier_once()
 
@@ -1263,7 +1538,7 @@ class TradingEngine:
                     adverse_unit_slip = max(
                         Decimal("0.0000"), expected_fill_price - actual_fill_price
                     )
-                effective_qty = filled_qty if filled_qty > Decimal("0") else intent.count
+                effective_qty = filled_qty
                 actual_slippage_dollars = (adverse_unit_slip * effective_qty).quantize(
                     Decimal("0.0001")
                 )
@@ -1273,7 +1548,7 @@ class TradingEngine:
                     client_order_id=v2_order.client_order_id,
                     intent_id=intent.intent_id,
                     ticker=intent.ticker,
-                    mode=s.execution_mode,
+                    mode=route,
                     side=intent.side,
                     count=effective_qty,
                     requested_price=intent.limit_price,
@@ -1301,7 +1576,7 @@ class TradingEngine:
                         client_order_id=v2_order.client_order_id,
                         intent_id=intent.intent_id,
                         ticker=intent.ticker,
-                        mode=s.execution_mode,
+                        mode=route,
                         side=intent.side,
                         count=intent.count,
                         requested_price=intent.limit_price,
@@ -1324,7 +1599,7 @@ class TradingEngine:
                         client_order_id=v2_order.client_order_id,
                         intent_id=intent.intent_id,
                         ticker=intent.ticker,
-                        mode=s.execution_mode,
+                        mode=route,
                         side=intent.side,
                         count=intent.count,
                         requested_price=intent.limit_price,
@@ -1397,6 +1672,8 @@ class TradingEngine:
                 "Cannot start in 'demo' mode while environment is set to 'production'."
             )
         self.risk_gate.reset(self.portfolio)
+        await self._persist_kill_state(False)
+        self._exit_mode_when_paused = None
         new_s = self.config_manager.update_and_persist({"execution_mode": target_mode.value})
         if self._task is None or self._task.done():
             await self._ensure_single_engine_loop()
@@ -1411,6 +1688,7 @@ class TradingEngine:
         s = self.config_manager.settings
         if s.execution_mode != ExecutionMode.PAUSED:
             self._last_mode_before_pause = s.execution_mode
+            self._exit_mode_when_paused = s.execution_mode
         self.config_manager.update_and_persist({"execution_mode": ExecutionMode.PAUSED.value})
 
     async def reset_shadow(self) -> dict[str, Any]:
@@ -1421,13 +1699,8 @@ class TradingEngine:
                 {"execution_mode": ExecutionMode.PAUSED.value}
             )
 
+            # Shadow sessions always start from the configured INITIAL_CAPITAL (M2 isolation)
             starting_equity = s.initial_capital
-            if self.rest_client is not None and self.rest_client.signer is not None:
-                try:
-                    bal, _ = await self.rest_client.get_balance()
-                    starting_equity = bal.balance_dollars
-                except Exception as exc:
-                    logger.warning("Reset shadow balance fetch failed, using initial_capital: %s", exc)
 
             reset_ts = int(time.time() * 1000)
             self.session_start_ts = reset_ts
@@ -1435,6 +1708,8 @@ class TradingEngine:
 
             self.simulator.reset(self.portfolio, starting_equity)
             self.risk_gate.reset(self.portfolio)
+            await self._persist_kill_state(False)
+            await self._save_daily_baseline("shadow", datetime.now(timezone.utc).date().isoformat())
             session_id = self.telemetry.new_session(session_start_ts=reset_ts)
 
             self.equity_history.clear()
@@ -1455,22 +1730,94 @@ class TradingEngine:
             }
 
     async def emergency_kill(self) -> dict[str, Any]:
-        """Immediately trip kill-switch, pause engine, and cancel all resting orders."""
+        """Trip the kill-switch, pause new entries, cancel engine orders, and flatten positions."""
+        s = self.config_manager.settings
+        prior_mode = self._effective_mode(s)
         self.portfolio.kill_switch_tripped = True
-        self.config_manager.update_and_persist({"execution_mode": ExecutionMode.PAUSED.value})
+        self.risk_gate.kill_switch_tripped = True
+        await self._persist_kill_state(True)
+        if prior_mode != ExecutionMode.PAUSED:
+            self._last_mode_before_pause = prior_mode
+            self._exit_mode_when_paused = prior_mode
+        if s.execution_mode != ExecutionMode.PAUSED:
+            self.config_manager.update_and_persist({"execution_mode": ExecutionMode.PAUSED.value})
+            s = self.config_manager.settings
+
         canceled = 0
-        if self.rest_client is not None and self.rest_client.signer is not None:
-            try:
-                results = await self.rest_client.cancel_all_orders()
-                canceled = len(results)
-            except Exception as exc:
-                logger.error("Emergency cancel_all_orders error: %s", exc)
+        async with self._engine_lock:
+            if (
+                prior_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE)
+                and self.rest_client is not None
+                and self.rest_client.signer is not None
+            ):
+                try:
+                    results = await self.rest_client.cancel_all_orders()
+                    canceled = len(results)
+                except Exception as exc:
+                    logger.error("Emergency cancel_all_orders error: %s", exc)
+            flatten = await self._flatten_positions(s, prior_mode)
         await self.telemetry.broadcast("STATUS", self.get_status())
-        return {"canceled_orders": canceled}
+        return {"canceled_orders": canceled, "flatten": flatten}
+
+    async def _flatten_positions(
+        self, s: AppSettings, mode: ExecutionMode
+    ) -> list[dict[str, Any]]:
+        """Send one IOC closing order per open position at the live inside quote."""
+        results: list[dict[str, Any]] = []
+        for ticker, pos in list(self.portfolio.positions.items()):
+            qty_open = abs(pos.net_contracts)
+            if qty_open == Decimal("0"):
+                continue
+            entry: dict[str, Any] = {"ticker": ticker, "requested_contracts": str(qty_open)}
+            snap = self.ws_client.orderbooks.get(ticker) if self.ws_client is not None else None
+            if mode == ExecutionMode.PAUSED:
+                entry.update(status="skipped_no_active_mode", remaining_contracts=str(qty_open))
+                results.append(entry)
+                continue
+            if snap is None or snap.best_yes_bid is None or snap.best_yes_ask is None:
+                entry.update(status="no_book", remaining_contracts=str(qty_open))
+                results.append(entry)
+                continue
+            side = OrderSide.ASK if pos.net_contracts > Decimal("0") else OrderSide.BID
+            px = snap.best_yes_bid if side == OrderSide.ASK else snap.best_yes_ask
+            walk = walk_book(snap, side, qty_open, limit_price=px)
+            if walk.fillable_count <= Decimal("0"):
+                entry.update(status="no_liquidity", remaining_contracts=str(qty_open))
+                results.append(entry)
+                continue
+            intent = TradeIntent(
+                timestamp_ms=int(time.time() * 1000),
+                ticker=ticker,
+                side=side,
+                count=walk.fillable_count,
+                limit_price=px,
+                expected_edge_dollars=Decimal("0.00"),
+                hold_to_expiry=False,
+                confidence=Decimal("1.00"),
+                inference_latency_ms=0,
+                rationale=f"Emergency flatten {qty_open} @ inside ${px:.4f}",
+                provider="emergency_flatten",
+            )
+            d = intent.model_dump(mode="json")
+            d["action"] = "BUY" if side == OrderSide.BID else "SELL"
+            d["decision_status"] = "DETERMINISTIC_EXIT"
+            await self.telemetry.log_ai_decision(d)
+            await self._evaluate_and_execute_intent(
+                intent, snap, s, execute_orders=True, mode=mode, emergency=True
+            )
+            remaining_pos = self.portfolio.positions.get(ticker)
+            remaining = abs(remaining_pos.net_contracts) if remaining_pos is not None else Decimal("0")
+            entry.update(
+                status="flattened" if remaining == Decimal("0") else "partial_or_pending",
+                remaining_contracts=str(remaining),
+            )
+            results.append(entry)
+            logger.warning("[FLATTEN] %s", entry)
+        return results
 
 
 async def run_orchestrator(host: str | None = None, port: int | None = None, confirm_live: bool = False) -> None:
-    cfg_mgr = ConfigManager()
+    cfg_mgr = ConfigManager(allow_live=confirm_live)
     s = cfg_mgr.settings
 
     if s.execution_mode == ExecutionMode.LIVE and not confirm_live:
@@ -1531,7 +1878,7 @@ def cli(argv: list[str] | None = None) -> None:
         help="Required to allow execution_mode=live on startup",
     )
 
-    exp_p = sub.add_parser("export", help="Export telemetry SQLite WAL tables")
+    exp_p = sub.add_parser("export", help="Export all telemetry SQLite WAL tables (full history) to Parquet")
     exp_p.add_argument("--format", choices=["parquet"], default="parquet")
     exp_p.add_argument("--output-dir", default="data/exports", help="Output directory")
     exp_p.add_argument("--db-path", default="data/kalshi_telemetry.db", help="SQLite DB path")

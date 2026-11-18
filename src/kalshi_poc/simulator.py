@@ -250,44 +250,63 @@ class ShadowSimulator:
         fee: Decimal,
         timestamp_ms: int,
     ) -> None:
+        """Apply a fill to YES-normalized portfolio state.
+
+        Conventions: `net_contracts` > 0 is long YES, < 0 is long NO. `avg_entry_price` is always
+        quoted on the YES leg; `cost_basis_dollars` is the collateral actually paid (YES price
+        for longs, 1 - YES price for NO positions). The whole `fee` is charged once per fill.
+        """
         pos = portfolio.positions.get(ticker) or Position(ticker=ticker)
         portfolio.recent_order_timestamps_ms.append(timestamp_ms)
+        q4 = Decimal("0.0001")
 
         if side == OrderSide.BID:
-            cost = count * fill_price + fee
-            portfolio.cash_balance_dollars -= cost
-            new_contracts = pos.net_contracts + count
-            pos.cost_basis_dollars += count * fill_price
-            pos.net_contracts = new_contracts
-            if new_contracts != Decimal("0"):
-                pos.avg_entry_price = (
-                    pos.cost_basis_dollars / abs(new_contracts)
-                ).quantize(Decimal("0.0001"))
+            # Buying YES at fill_price: first closes any NO position, remainder opens/adds long YES
+            if pos.net_contracts < Decimal("0"):
+                close_qty = min(abs(pos.net_contracts), count)
+                no_entry_price = ONE - pos.avg_entry_price
+                portfolio.cash_balance_dollars += close_qty * (ONE - fill_price) - fee
+                pos.realized_pnl_dollars += close_qty * (pos.avg_entry_price - fill_price) - fee
+                pos.net_contracts += close_qty
+                pos.cost_basis_dollars = max(
+                    Decimal("0.00"), pos.cost_basis_dollars - close_qty * no_entry_price
+                )
+                rem = count - close_qty
+                if rem > Decimal("0"):
+                    portfolio.cash_balance_dollars -= rem * fill_price
+                    pos.net_contracts += rem
+                    pos.cost_basis_dollars = rem * fill_price
+                    pos.avg_entry_price = fill_price
+            else:
+                portfolio.cash_balance_dollars -= count * fill_price + fee
+                pos.net_contracts += count
+                pos.cost_basis_dollars += count * fill_price
+                pos.avg_entry_price = (pos.cost_basis_dollars / pos.net_contracts).quantize(q4)
         else:
-            # Selling YES / buying NO at (1 - fill_price)
+            # Selling YES / buying NO at (1 - fill_price): first closes any long YES position
             no_price = ONE - fill_price
-            cost = count * no_price + fee
             if pos.net_contracts > Decimal("0"):
                 close_qty = min(pos.net_contracts, count)
-                proceeds = close_qty * fill_price - fee
-                realized = close_qty * (fill_price - pos.avg_entry_price) - fee
-                pos.realized_pnl_dollars += realized
+                portfolio.cash_balance_dollars += close_qty * fill_price - fee
+                pos.realized_pnl_dollars += close_qty * (fill_price - pos.avg_entry_price) - fee
                 pos.net_contracts -= close_qty
                 pos.cost_basis_dollars = max(
                     Decimal("0.00"), pos.cost_basis_dollars - close_qty * pos.avg_entry_price
                 )
-                portfolio.cash_balance_dollars += proceeds
                 rem = count - close_qty
                 if rem > Decimal("0"):
                     portfolio.cash_balance_dollars -= rem * no_price
                     pos.net_contracts -= rem
-                    pos.cost_basis_dollars += rem * no_price
+                    pos.cost_basis_dollars = rem * no_price
                     pos.avg_entry_price = fill_price
             else:
-                portfolio.cash_balance_dollars -= cost
+                portfolio.cash_balance_dollars -= count * no_price + fee
                 pos.net_contracts -= count
                 pos.cost_basis_dollars += count * no_price
-                pos.avg_entry_price = fill_price
+                # Weighted YES-leg entry implied by total NO collateral paid
+                pos.avg_entry_price = (
+                    ONE - pos.cost_basis_dollars / abs(pos.net_contracts)
+                ).quantize(q4)
 
         if pos.net_contracts == Decimal("0"):
             pos.cost_basis_dollars = Decimal("0.00")
