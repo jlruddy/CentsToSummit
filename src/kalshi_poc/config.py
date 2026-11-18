@@ -49,6 +49,23 @@ class AppSettings(BaseSettings):
     max_orders_per_minute: int = Field(default=10, ge=1, le=600)
     min_net_edge_dollars: Decimal = Field(default=Decimal("0.02"), ge=Decimal("0"))
     max_slippage_cents: Decimal = Field(default=Decimal("3"), ge=Decimal("0"))
+    # Risk-reducing exits may cross wider books than entries (a wide spread must not trap a position)
+    exit_max_slippage_cents: Decimal = Field(default=Decimal("6"), ge=Decimal("0"))
+
+    # Deterministic exits (engine-side; Kalshi event contracts have no native stop orders).
+    # Prices are on the position's own side: YES bid for YES positions, NO bid for NO positions.
+    take_profit_min_gain: Decimal = Field(default=Decimal("0.18"), ge=Decimal("0"), le=Decimal("1"))
+    take_profit_min_price: Decimal = Field(default=Decimal("0.78"), gt=Decimal("0"), lt=Decimal("1"))
+    take_profit_lock_price: Decimal = Field(default=Decimal("0.85"), gt=Decimal("0"), lt=Decimal("1"))
+    stop_loss_drop: Decimal = Field(default=Decimal("0.22"), gt=Decimal("0"), le=Decimal("1"))
+    stop_loss_disable_secs: int = Field(default=180, ge=0, le=3600)
+    trailing_stop_enabled: bool = Field(default=True)
+    trailing_stop_activation_gain: Decimal = Field(
+        default=Decimal("0.08"), ge=Decimal("0"), le=Decimal("1")
+    )
+    trailing_stop_distance: Decimal = Field(default=Decimal("0.06"), gt=Decimal("0"), le=Decimal("1"))
+    # After any approved exit, block new entries in that same market for this many seconds (0 = off).
+    reentry_cooldown_secs: int = Field(default=60, ge=0, le=3600)
 
     # Tax-Hygiene Allowlist & Discovery Priority
     allowed_series_prefixes: list[str] = Field(
@@ -72,6 +89,20 @@ class AppSettings(BaseSettings):
     db_path: str = Field(default="data/kalshi_telemetry.db")
     web_host: str = Field(default="127.0.0.1")
     web_port: int = Field(default=8000, ge=1, le=65535)
+    # Extra Host/Origin hostnames accepted by the control panel (127.0.0.1/localhost/::1 always are)
+    web_allowed_hosts: list[str] = Field(default_factory=list)
+
+    @field_validator("web_allowed_hosts", mode="before")
+    @classmethod
+    def parse_host_list(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            v = json.loads(v) if v.startswith("[") else v.split(",")
+        if isinstance(v, list):
+            return [str(x).strip().lower() for x in v if str(x).strip()]
+        return []
 
     @field_validator("allowed_series_prefixes", "subscribed_tickers", mode="before")
     @classmethod
@@ -104,6 +135,11 @@ class AppSettings(BaseSettings):
         return Path(self.kalshi_private_key_path).expanduser()
 
 
+def _q(value: str) -> str:
+    """Double-quote a .env value (dotenv decodes the escapes) so newlines/#/quotes cannot inject."""
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _atomic_write(path: Path, content: str, mode: int | None = None) -> None:
     """Write content atomically using a temporary file and os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,8 +166,11 @@ class ConfigManager:
         env_path: Path | str = ".env",
         config_json_path: Path | str = "config.json",
         key_dir: Path | str = "~/.kalshi",
+        allow_live: bool = False,
     ) -> None:
         self._lock = threading.RLock()
+        # C2: live execution is only reachable when the process was started with --confirm-live
+        self.allow_live = allow_live
         self.env_path = Path(env_path)
         self.config_json_path = Path(config_json_path)
         self.key_dir = Path(key_dir).expanduser()
@@ -139,7 +178,7 @@ class ConfigManager:
         self._settings = self._load_initial()
 
     def _load_initial(self) -> AppSettings:
-        base = AppSettings()
+        base = AppSettings(_env_file=self.env_path)
         if self.config_json_path.exists():
             try:
                 data = json.loads(self.config_json_path.read_text(encoding="utf-8"))
@@ -219,6 +258,11 @@ class ConfigManager:
 
             current.update(cleaned)
             new_settings = AppSettings.model_validate(current)
+            if new_settings.execution_mode == ExecutionMode.LIVE and not self.allow_live:
+                raise ValueError(
+                    "execution_mode=live is disabled: restart with `kalshi-poc run --confirm-live` "
+                    "to allow real-money trading."
+                )
 
             self._persist_files(new_settings)
             self._settings = new_settings
@@ -234,8 +278,8 @@ class ConfigManager:
 
         env_lines = [
             f"KALSHI_ENVIRONMENT={s.kalshi_environment.value}",
-            f"KALSHI_API_KEY_ID={s.kalshi_api_key_id}",
-            f"KALSHI_PRIVATE_KEY_PATH={s.kalshi_private_key_path}",
+            f"KALSHI_API_KEY_ID={_q(s.kalshi_api_key_id)}",
+            f"KALSHI_PRIVATE_KEY_PATH={_q(s.kalshi_private_key_path)}",
             f"EXECUTION_MODE={s.execution_mode.value}",
             f"INITIAL_CAPITAL={s.initial_capital}",
             f"EQUITY_FLOOR={s.equity_floor}",
@@ -248,20 +292,31 @@ class ConfigManager:
             f"MAX_ORDERS_PER_MINUTE={s.max_orders_per_minute}",
             f"MIN_NET_EDGE_DOLLARS={s.min_net_edge_dollars}",
             f"MAX_SLIPPAGE_CENTS={s.max_slippage_cents}",
+            f"EXIT_MAX_SLIPPAGE_CENTS={s.exit_max_slippage_cents}",
+            f"TAKE_PROFIT_MIN_GAIN={s.take_profit_min_gain}",
+            f"TAKE_PROFIT_MIN_PRICE={s.take_profit_min_price}",
+            f"TAKE_PROFIT_LOCK_PRICE={s.take_profit_lock_price}",
+            f"STOP_LOSS_DROP={s.stop_loss_drop}",
+            f"STOP_LOSS_DISABLE_SECS={s.stop_loss_disable_secs}",
+            f"TRAILING_STOP_ENABLED={str(s.trailing_stop_enabled).lower()}",
+            f"TRAILING_STOP_ACTIVATION_GAIN={s.trailing_stop_activation_gain}",
+            f"TRAILING_STOP_DISTANCE={s.trailing_stop_distance}",
+            f"REENTRY_COOLDOWN_SECS={s.reentry_cooldown_secs}",
             f"ALLOWED_SERIES_PREFIXES={json.dumps(s.allowed_series_prefixes)}",
             f"ENFORCE_FINANCIAL_ONLY={str(s.enforce_financial_only).lower()}",
             f"PREFER_15M_TURNOVER={str(s.prefer_15m_turnover).lower()}",
             f"SUBSCRIBED_TICKERS={json.dumps(s.subscribed_tickers)}",
             f"STRATEGY_PROVIDER={s.strategy_provider.value}",
-            f"LLM_API_KEY={s.llm_api_key}",
-            f"LLM_ENDPOINT={s.llm_endpoint}",
-            f"LLM_MODEL={s.llm_model}",
+            f"LLM_API_KEY={_q(s.llm_api_key)}",
+            f"LLM_ENDPOINT={_q(s.llm_endpoint)}",
+            f"LLM_MODEL={_q(s.llm_model)}",
             f"LLM_TEMPERATURE={s.llm_temperature}",
-            f"SYSTEM_PROMPT_OVERRIDE={json.dumps(s.system_prompt_override)}",
+            f"SYSTEM_PROMPT_OVERRIDE={_q(s.system_prompt_override)}",
             f"LLM_MIN_COOLDOWN_SEC={s.llm_min_cooldown_sec}",
             f"LLM_HEARTBEAT_SEC={s.llm_heartbeat_sec}",
-            f"DB_PATH={s.db_path}",
-            f"WEB_HOST={s.web_host}",
+            f"DB_PATH={_q(s.db_path)}",
+            f"WEB_HOST={_q(s.web_host)}",
             f"WEB_PORT={s.web_port}",
+            f"WEB_ALLOWED_HOSTS={json.dumps(s.web_allowed_hosts)}",
         ]
         _atomic_write(self.env_path, "\n".join(env_lines) + "\n", mode=0o600)

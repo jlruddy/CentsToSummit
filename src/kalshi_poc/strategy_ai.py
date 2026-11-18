@@ -59,6 +59,8 @@ class BatchEvaluationResult:
     completion_tokens: int = 0
     estimated_cost_usd: Decimal = Decimal("0.000000")
     invoked_llm: bool = False
+    # Raw LLM I/O for research telemetry (system/user prompt, raw response, tokens, error)
+    llm_call: dict[str, Any] | None = None
 
 
 def estimate_llm_cost_usd(
@@ -369,6 +371,7 @@ class StubMomentumStrategy(BaseStrategy):
                                 f"unrealized={unrealized:+.4f}/c, imb={imbalance:+.2f})"
                             ),
                             provider=StrategyProvider.STUB_MOMENTUM.value,
+                            reduce_only=True,
                         )
                         detail = intent.model_dump(mode="json")
                         detail["action"] = "SELL"
@@ -408,6 +411,7 @@ class StubMomentumStrategy(BaseStrategy):
                                 f"unrealized={unrealized:+.4f}/c, imb={imbalance:+.2f})"
                             ),
                             provider=StrategyProvider.STUB_MOMENTUM.value,
+                            reduce_only=True,
                         )
                         detail = intent.model_dump(mode="json")
                         detail["action"] = "BUY"
@@ -733,6 +737,9 @@ class _LLMStrategyBase(BaseStrategy):
         payload = {
             "remaining_deployable_budget_dollars": f"{deployable:.2f}",
             "max_position_dollars_per_market": f"{effective_max_pos:.2f}",
+            # New entries must be priced below this on their own side (YES price for bids,
+            # 1 - limit for asks); the risk gate rejects anything at or above it.
+            "max_entry_price_own_side": f"{self._entry_ceiling():.2f}",
             "open_positions": open_positions,
             "markets": markets_payload,
         }
@@ -740,6 +747,10 @@ class _LLMStrategyBase(BaseStrategy):
             "Evaluate all markets below in one pass and return a JSON array of TradeIntent objects "
             f"(or [] if all are HOLD):\n{json.dumps(payload)}"
         )
+
+    def _entry_ceiling(self) -> Decimal:
+        """Highest own-side entry price that still leaves room before the take-profit lock."""
+        return self.settings.take_profit_lock_price - self.settings.trailing_stop_activation_gain
 
     def _system_prompt(self) -> str:
         override = self.settings.system_prompt_override.strip()
@@ -757,6 +768,42 @@ class _LLMStrategyBase(BaseStrategy):
         blocked_tickers: set[str] | None = None,
         positions_by_ticker: dict[str, Position] | None = None,
     ) -> list[TradeIntent]:
+        intents, _ = self._parse_batch_intents_detailed(
+            raw_text, snapshots, latency_ms, blocked_tickers, positions_by_ticker
+        )
+        return intents
+
+    @staticmethod
+    def _extract_json_payload(raw_text: str) -> Any:
+        text = raw_text.strip()
+        if "```" in text:
+            for part in text.split("```"):
+                cleaned = part.strip()
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:].strip()
+                if cleaned.startswith("[") or cleaned.startswith("{"):
+                    text = cleaned
+                    break
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("intents") or ([parsed] if "ticker" in parsed else [])
+        return parsed
+
+    def _parse_batch_intents_detailed(
+        self,
+        raw_text: str,
+        snapshots: list[OrderbookSnapshot],
+        latency_ms: int,
+        blocked_tickers: set[str] | None = None,
+        positions_by_ticker: dict[str, Position] | None = None,
+    ) -> tuple[list[TradeIntent], list[dict[str, Any]]]:
+        """Parse LLM output item by item.
+
+        Returns (intents, rejections). Every proposal that does not become an intent is kept as
+        a rejection {"status": "PARSE_ERROR" | "FILTERED", "reason", "proposal"} so research
+        telemetry records exactly what the model proposed, never a silent HOLD. Each intent
+        carries its raw proposal in `self._last_raw_proposals[intent_id]`.
+        """
         snap_map = {s.ticker: s for s in snapshots}
         pos_map = positions_by_ticker or {}
         blocked_resting = set(blocked_tickers) if blocked_tickers else set()
@@ -768,32 +815,53 @@ class _LLMStrategyBase(BaseStrategy):
                 if hk is not None:
                     active_hour_keys.add(hk)
         max_slip_dollars = self.settings.max_slippage_cents / Decimal("100")
-        try:
-            text = raw_text.strip()
-            if "```" in text:
-                for part in text.split("```"):
-                    cleaned = part.lstrip("json").strip()
-                    if cleaned.startswith("[") or cleaned.startswith("{"):
-                        text = cleaned
-                        break
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                parsed = parsed.get("intents") or ([parsed] if "ticker" in parsed else [])
-            if not isinstance(parsed, list):
-                return []
+        intents: list[TradeIntent] = []
+        rejections: list[dict[str, Any]] = []
+        self._last_raw_proposals: dict[str, dict[str, Any]] = {}
 
-            intents: list[TradeIntent] = []
-            ts_ms = int(time.time() * 1000)
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
+        try:
+            parsed = self._extract_json_payload(raw_text)
+        except Exception as exc:
+            rejections.append(
+                {
+                    "status": "PARSE_ERROR",
+                    "reason": f"Response is not valid JSON: {exc}",
+                    "proposal": {"raw_text": raw_text[:4000]},
+                }
+            )
+            return intents, rejections
+        if not isinstance(parsed, list):
+            rejections.append(
+                {
+                    "status": "PARSE_ERROR",
+                    "reason": f"Expected a JSON array, got {type(parsed).__name__}",
+                    "proposal": {"raw_text": raw_text[:4000]},
+                }
+            )
+            return intents, rejections
+
+        ts_ms = int(time.time() * 1000)
+
+        def reject(item: dict[str, Any], status: str, reason: str) -> None:
+            rejections.append({"status": status, "reason": reason, "proposal": item})
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                reject({"raw_item": item}, "PARSE_ERROR", "Proposal is not a JSON object")
+                continue
+            try:
                 if str(item.get("action", "trade")).lower() == "hold":
                     continue
                 ticker = str(item.get("ticker", ""))
-                if not ticker or ticker in seen_tickers:
+                if not ticker:
+                    reject(item, "PARSE_ERROR", "Missing ticker")
+                    continue
+                if ticker in seen_tickers:
+                    reject(item, "FILTERED", "Duplicate proposal for ticker in batch")
                     continue
                 snap = snap_map.get(ticker)
                 if snap is None or snap.best_yes_bid is None or snap.best_yes_ask is None:
+                    reject(item, "FILTERED", "Ticker not in evaluated batch or book is one-sided")
                     continue
                 side = OrderSide(str(item["side"]).lower())
                 existing_pos = pos_map.get(ticker)
@@ -801,6 +869,7 @@ class _LLMStrategyBase(BaseStrategy):
                     existing_pos is not None and existing_pos.net_contracts != Decimal("0")
                 )
                 is_reducing_exit = False
+                hour_key: str | None = None
                 if has_open_pos and existing_pos is not None:
                     if (
                         existing_pos.net_contracts > Decimal("0") and side == OrderSide.ASK
@@ -809,20 +878,21 @@ class _LLMStrategyBase(BaseStrategy):
                     ):
                         is_reducing_exit = True
                     else:
-                        # Same-direction pyramiding when already holding a position is strictly blocked
+                        reject(item, "FILTERED", "Same-direction pyramiding on open position")
                         continue
                 elif ticker in blocked_resting:
+                    reject(item, "FILTERED", "Resting order already active on ticker")
                     continue
                 else:
-                    hk = extract_underlying_expiry_hour(ticker)
-                    if hk is not None and hk in active_hour_keys:
+                    hour_key = extract_underlying_expiry_hour(ticker)
+                    if hour_key is not None and hour_key in active_hour_keys:
+                        reject(item, "FILTERED", f"Correlated underlying + expiry hour {hour_key}")
                         continue
 
-                # Block if a resting order is already active on this ticker
                 if ticker in blocked_resting and positions_by_ticker is not None:
+                    reject(item, "FILTERED", "Resting order already active on ticker")
                     continue
 
-                seen_tickers.add(ticker)
                 raw_price = Decimal(str(item["limit_price"]))
                 # Abort if live inside quote moved > max_slippage past AI reference price;
                 # otherwise clamp limit_price to at most inside_ask + $0.01 on that side.
@@ -836,6 +906,7 @@ class _LLMStrategyBase(BaseStrategy):
                             inside_ask,
                             max_slip_dollars,
                         )
+                        reject(item, "FILTERED", f"Inside ask {inside_ask} moved > max slippage past {raw_price}")
                         continue
                     limit_px = min(
                         max(raw_price, inside_ask),
@@ -852,6 +923,7 @@ class _LLMStrategyBase(BaseStrategy):
                             inside_bid,
                             max_slip_dollars,
                         )
+                        reject(item, "FILTERED", f"Inside bid {inside_bid} moved > max slippage past {raw_price}")
                         continue
                     limit_px = max(
                         min(raw_price, inside_bid),
@@ -863,50 +935,56 @@ class _LLMStrategyBase(BaseStrategy):
                     Decimal("0.15") <= limit_px <= Decimal("0.85")
                     and Decimal("0.15") <= (Decimal("1.00") - limit_px) <= Decimal("0.85")
                 ):
+                    reject(item, "FILTERED", f"Limit {limit_px} outside [$0.15, $0.85] band")
+                    continue
+                own_side_px = limit_px if side == OrderSide.BID else (Decimal("1.00") - limit_px)
+                if not is_reducing_exit and own_side_px >= self._entry_ceiling():
+                    reject(
+                        item,
+                        "FILTERED",
+                        f"Entry {own_side_px} at/above max_entry_price_own_side {self._entry_ceiling():.2f}",
+                    )
                     continue
 
                 count_dec = Decimal(str(item["count"]))
                 if is_reducing_exit and existing_pos is not None:
                     count_dec = min(count_dec, abs(existing_pos.net_contracts))
                     if count_dec <= Decimal("0"):
+                        reject(item, "FILTERED", "Exit count <= 0 after capping to position")
                         continue
-                else:
-                    hk = extract_underlying_expiry_hour(ticker)
-                    if hk is not None:
-                        active_hour_keys.add(hk)
 
-                if "expected_edge_per_contract" in item and item["expected_edge_per_contract"] is not None:
+                if item.get("expected_edge_per_contract") is not None:
                     edge_per_c = Decimal(str(item["expected_edge_per_contract"]))
                     total_edge = (edge_per_c * count_dec).quantize(Decimal("0.01"))
                 else:
-                    raw_edge = Decimal(str(item.get("expected_edge_dollars", "0.00")))
-                    # Normalize per-contract LLM edge outputs when count > 1
-                    if count_dec > Decimal("1") and raw_edge <= Decimal("0.15"):
-                        edge_per_c = raw_edge
-                        total_edge = (raw_edge * count_dec).quantize(Decimal("0.01"))
-                    else:
-                        edge_per_c = (raw_edge / count_dec).quantize(Decimal("0.0001"))
-                        total_edge = raw_edge
-                intents.append(
-                    TradeIntent(
-                        timestamp_ms=ts_ms,
-                        ticker=ticker,
-                        side=side,
-                        count=count_dec,
-                        limit_price=limit_px,
-                        expected_edge_dollars=total_edge,
-                        expected_edge_per_contract=edge_per_c,
-                        hold_to_expiry=False if is_reducing_exit else bool(item.get("hold_to_expiry", False)),
-                        confidence=Decimal(str(item.get("confidence", "0.50"))),
-                        inference_latency_ms=latency_ms,
-                        rationale=str(item.get("rationale", "LLM batch signal"))[:400],
-                        provider=self.provider_name,
-                    )
+                    # expected_edge_dollars is the order total (never guessed as per-contract)
+                    total_edge = Decimal(str(item.get("expected_edge_dollars", "0.00")))
+                    edge_per_c = (total_edge / count_dec).quantize(Decimal("0.0001"))
+                intent = TradeIntent(
+                    timestamp_ms=ts_ms,
+                    ticker=ticker,
+                    side=side,
+                    count=count_dec,
+                    limit_price=limit_px,
+                    expected_edge_dollars=total_edge,
+                    expected_edge_per_contract=edge_per_c,
+                    hold_to_expiry=False if is_reducing_exit else bool(item.get("hold_to_expiry", False)),
+                    reduce_only=is_reducing_exit,
+                    confidence=Decimal(str(item.get("confidence", "0.50"))),
+                    inference_latency_ms=latency_ms,
+                    rationale=str(item.get("rationale", "LLM batch signal"))[:400],
+                    provider=self.provider_name,
                 )
-            return intents
-        except Exception as exc:
-            logger.debug("Failed to parse batched LLM output: %s", exc)
-            return []
+            except Exception as exc:
+                reject(item, "PARSE_ERROR", f"{type(exc).__name__}: {exc}"[:400])
+                continue
+
+            seen_tickers.add(ticker)
+            if hour_key is not None:
+                active_hour_keys.add(hour_key)
+            intents.append(intent)
+            self._last_raw_proposals[intent.intent_id] = item
+        return intents, rejections
 
     async def _call_llm_batch(
         self, prompt: str
@@ -934,7 +1012,9 @@ class _LLMStrategyBase(BaseStrategy):
         self._record_mid_prices(snapshots)
         ts_ms = int(time.time() * 1000)
 
-        def _hold_batch(reason: str) -> BatchEvaluationResult:
+        def _hold_batch(
+            reason: str, status: str = "GATED", llm_call: dict[str, Any] | None = None
+        ) -> BatchEvaluationResult:
             snap0 = snapshots[0]
             return BatchEvaluationResult(
                 decisions=[
@@ -954,8 +1034,12 @@ class _LLMStrategyBase(BaseStrategy):
                         "completion_tokens": 0,
                         "estimated_cost_usd": "0.000000",
                         "rationale": reason,
+                        "decision_status": status,
+                        "llm_call_id": llm_call["llm_call_id"] if llm_call else "",
                     }
-                ]
+                ],
+                llm_call=llm_call,
+                invoked_llm=llm_call is not None,
             )
 
         if self._inflight_lock.locked():
@@ -967,6 +1051,21 @@ class _LLMStrategyBase(BaseStrategy):
 
         async with self._inflight_lock:
             prompt = self._build_batch_prompt(snapshots, portfolio, pos_map)
+            llm_call: dict[str, Any] = {
+                "llm_call_id": f"llm-{uuid.uuid4().hex[:12]}",
+                "timestamp_ms": ts_ms,
+                "provider": self.provider_name,
+                "model": self.settings.llm_model,
+                "trigger_reason": trigger_reason,
+                "system_prompt": self._system_prompt(),
+                "user_prompt": prompt,
+                "raw_response": "",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "estimated_cost_usd": "0.000000",
+                "latency_ms": 0,
+                "error": "",
+            }
             self._last_llm_call_monotonic = time.monotonic()
             t0 = time.perf_counter()
             try:
@@ -980,10 +1079,16 @@ class _LLMStrategyBase(BaseStrategy):
                 logger.warning(
                     "%s HTTP %s error during batch inference", self.provider_name, status_code
                 )
-                return _hold_batch(f"{self.provider_name} error: HTTP {status_code}")
+                llm_call["error"] = f"HTTP {status_code}"
+                llm_call["latency_ms"] = max(1, int((time.perf_counter() - t0) * 1000))
+                return _hold_batch(
+                    f"{self.provider_name} error: HTTP {status_code}", "LLM_ERROR", llm_call
+                )
             except Exception as exc:
                 logger.warning("%s batch inference error/timeout: %r", self.provider_name, exc)
-                return _hold_batch(f"{self.provider_name} error: {exc!r}")
+                llm_call["error"] = repr(exc)[:1000]
+                llm_call["latency_ms"] = max(1, int((time.perf_counter() - t0) * 1000))
+                return _hold_batch(f"{self.provider_name} error: {exc!r}", "LLM_ERROR", llm_call)
 
             latency_ms = max(1, int((time.perf_counter() - t0) * 1000))
             for snap in snapshots:
@@ -993,25 +1098,31 @@ class _LLMStrategyBase(BaseStrategy):
             cost_usd = estimate_llm_cost_usd(
                 self.provider_name, self.settings.llm_model, p_tok, c_tok
             )
-            intents = self._parse_batch_intents(
+            llm_call.update(
+                raw_response=raw_text,
+                prompt_tokens=p_tok,
+                completion_tokens=c_tok,
+                estimated_cost_usd=f"{cost_usd:.6f}",
+                latency_ms=latency_ms,
+            )
+            intents, rejections = self._parse_batch_intents_detailed(
                 raw_text,
                 snapshots,
                 latency_ms,
                 blocked_tickers=set(portfolio.resting_order_tickers),
                 positions_by_ticker=pos_map,
             )
+            raw_by_intent = getattr(self, "_last_raw_proposals", {})
+            call_id = llm_call["llm_call_id"]
 
             decisions: list[dict[str, Any]] = []
-            if intents:
-                # Attach token/cost metadata to the first intent's telemetry record
-                for idx, intent in enumerate(intents):
-                    d = intent.model_dump(mode="json")
-                    d["action"] = "BUY" if intent.side == OrderSide.BID else "SELL"
-                    d["prompt_tokens"] = p_tok if idx == 0 else 0
-                    d["completion_tokens"] = c_tok if idx == 0 else 0
-                    d["estimated_cost_usd"] = f"{cost_usd:.6f}" if idx == 0 else "0.000000"
-                    decisions.append(d)
-            else:
+            for intent in intents:
+                d = intent.model_dump(mode="json")
+                d["action"] = "BUY" if intent.side == OrderSide.BID else "SELL"
+                d["decision_status"] = "PROPOSED"
+                d["raw_proposal"] = raw_by_intent.get(intent.intent_id)
+                decisions.append(d)
+            if not intents:
                 decisions.append(
                     {
                         "timestamp_ms": int(time.time() * 1000),
@@ -1025,12 +1136,36 @@ class _LLMStrategyBase(BaseStrategy):
                         "confidence": "0.00",
                         "inference_latency_ms": latency_ms,
                         "provider": self.provider_name,
-                        "prompt_tokens": p_tok,
-                        "completion_tokens": c_tok,
-                        "estimated_cost_usd": f"{cost_usd:.6f}",
                         "rationale": f"{self.provider_name} ({trigger_reason}): HOLD across {len(snapshots)} markets",
+                        "decision_status": "HOLD",
                     }
                 )
+            for rej in rejections:
+                prop = rej["proposal"]
+                decisions.append(
+                    {
+                        "timestamp_ms": int(time.time() * 1000),
+                        "intent_id": f"rej-{uuid.uuid4().hex[:8]}",
+                        "ticker": str(prop.get("ticker") or f"BATCH({len(snapshots)})"),
+                        "action": "REJECTED",
+                        "side": "hold",
+                        "count": "0",
+                        "limit_price": "0.0000",
+                        "expected_edge_dollars": "0.00",
+                        "confidence": "0.00",
+                        "inference_latency_ms": latency_ms,
+                        "provider": self.provider_name,
+                        "rationale": f"{rej['status']}: {rej['reason']}",
+                        "decision_status": rej["status"],
+                        "raw_proposal": prop,
+                    }
+                )
+            # Attach token/cost metadata once (first record) so spend is never double-counted
+            for idx, d in enumerate(decisions):
+                d["llm_call_id"] = call_id
+                d["prompt_tokens"] = p_tok if idx == 0 else 0
+                d["completion_tokens"] = c_tok if idx == 0 else 0
+                d["estimated_cost_usd"] = f"{cost_usd:.6f}" if idx == 0 else "0.000000"
 
             return BatchEvaluationResult(
                 intents=intents,
@@ -1039,6 +1174,7 @@ class _LLMStrategyBase(BaseStrategy):
                 completion_tokens=c_tok,
                 estimated_cost_usd=cost_usd,
                 invoked_llm=True,
+                llm_call=llm_call,
             )
 
 

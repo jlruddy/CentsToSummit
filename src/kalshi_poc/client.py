@@ -763,6 +763,10 @@ class KalshiWebSocketClient:
         self._yes_books: dict[str, dict[Decimal, Decimal]] = {}
         self._no_books: dict[str, dict[Decimal, Decimal]] = {}
         self._sid_to_ticker: dict[int, str] = {}
+        # H7: every ticker carried by a subscription id, and that sid's last sequence number
+        self._sid_tickers: dict[int, set[str]] = {}
+        self._sid_last_seq: dict[int, int] = {}
+        self.seq_gap_count = 0
         self.tickers: list[str] = []
         self._ws: Any = None
         self._running = False
@@ -781,6 +785,7 @@ class KalshiWebSocketClient:
             "last_message_ms": self.last_message_ms,
             "reconnect_count": self.reconnect_count,
             "last_error": self.last_error,
+            "seq_gap_count": self.seq_gap_count,
             "subscribed_tickers": list(self.tickers),
         }
 
@@ -809,9 +814,12 @@ class KalshiWebSocketClient:
         new_list = list(dict.fromkeys(tickers))
         if set(new_list) == set(self.tickers):
             return
+        already = set(self.tickers)
+        added = [t for t in new_list if t not in already]
         self.tickers = new_list
-        if self._ws is not None and self.connected and new_list:
-            await self._send_subscribe(self._ws, new_list)
+        # Only subscribe the additions: re-subscribing live tickers would duplicate their deltas
+        if self._ws is not None and self.connected and added:
+            await self._send_subscribe(self._ws, added)
 
     async def unsubscribe_tickers(self, tickers_to_remove: list[str]) -> None:
         """Remove widened/off-band/expiring tickers from local books and WS subscription."""
@@ -819,11 +827,17 @@ class KalshiWebSocketClient:
             return
         remove_set = set(tickers_to_remove)
         self.tickers = [t for t in self.tickers if t not in remove_set]
-        sids_to_remove = [
-            sid for sid, t in list(self._sid_to_ticker.items()) if t in remove_set
-        ]
+        # Unsubscribe a sid only if *every* ticker it carries is being removed; otherwise the
+        # removed tickers are simply filtered locally (self.tickers) so kept books stay live.
+        sids_to_remove: list[int] = []
+        for sid in sorted(set(self._sid_tickers) | set(self._sid_to_ticker)):
+            carried = self._sid_tickers.get(sid) or {self._sid_to_ticker.get(sid, "")}
+            if carried and carried <= remove_set:
+                sids_to_remove.append(sid)
         for sid in sids_to_remove:
             self._sid_to_ticker.pop(sid, None)
+            self._sid_tickers.pop(sid, None)
+            self._sid_last_seq.pop(sid, None)
         for t in tickers_to_remove:
             self.orderbooks.pop(t, None)
             self._yes_books.pop(t, None)
@@ -854,9 +868,30 @@ class KalshiWebSocketClient:
         self._cmd_id += 1
         await ws.send(json.dumps(msg))
 
+    def _on_stream_lost(self) -> None:
+        """Drop every book built from the stream: missed deltas make them unsafe to price against."""
+        self.orderbooks.clear()
+        self._yes_books.clear()
+        self._no_books.clear()
+        self._sid_to_ticker.clear()
+        self._sid_tickers.clear()
+        self._sid_last_seq.clear()
+
+    async def _handle_seq_gap(self, sid: int, expected: int, got: int) -> None:
+        self.seq_gap_count += 1
+        self.last_error = f"seq gap on sid={sid}: expected {expected}, got {got}"
+        logger.warning("Kalshi WS %s; dropping books and resubscribing for fresh snapshots", self.last_error)
+        self._on_stream_lost()
+        if self._ws is not None:
+            try:
+                await self._ws.close()  # _run_loop reconnects and resubscribes -> new snapshots
+            except Exception as exc:
+                logger.debug("WS close after seq gap failed: %s", exc)
+
     async def _run_loop(self) -> None:
         backoff = 1.0
         while self._running:
+            was_connected = False
             try:
                 headers = (
                     self.signer.headers("GET", "/trade-api/ws/v2")
@@ -868,6 +903,7 @@ class KalshiWebSocketClient:
                 ) as ws:
                     self._ws = ws
                     self.connected = True
+                    was_connected = True
                     self.last_error = None
                     backoff = 1.0
                     if self.tickers:
@@ -888,6 +924,8 @@ class KalshiWebSocketClient:
             finally:
                 self.connected = False
                 self._ws = None
+                if was_connected:
+                    self._on_stream_lost()
 
     def set_snapshot(self, snap: OrderbookSnapshot) -> None:
         """Replace isolated per-ticker YES/NO bid maps from an OrderbookSnapshot."""
@@ -935,6 +973,18 @@ class KalshiWebSocketClient:
         if not ticker and sid is not None:
             ticker = self._sid_to_ticker.get(int(sid))
 
+        if msg_type in ("orderbook_snapshot", "orderbook_delta"):
+            seq = data.get("seq")
+            if sid is not None and seq is not None:
+                sid_i, seq_i = int(sid), int(seq)
+                prev = self._sid_last_seq.get(sid_i)
+                if prev is not None and seq_i != prev + 1:
+                    await self._handle_seq_gap(sid_i, prev + 1, seq_i)
+                    return
+                self._sid_last_seq[sid_i] = seq_i
+            if ticker and sid is not None:
+                self._sid_tickers.setdefault(int(sid), set()).add(str(ticker))
+
         if msg_type in ("orderbook_snapshot", "orderbook_delta", "ticker"):
             if not ticker or (self.tickers and ticker not in self.tickers):
                 return
@@ -980,39 +1030,8 @@ class KalshiWebSocketClient:
                 await self.on_orderbook(snap)
 
         elif msg_type == "ticker":
-            if not ticker or ticker in self.orderbooks:
-                return
-            yes_bid = msg.get("yes_bid_dollars")
-            no_bid = msg.get("no_bid_dollars")
-            yes_ask = msg.get("yes_ask_dollars")
-            if yes_bid is None and msg.get("yes_bid") is not None:
-                yes_bid = Decimal(str(msg["yes_bid"])) / Decimal("100")
-            if no_bid is None and msg.get("no_bid") is not None:
-                no_bid = Decimal(str(msg["no_bid"])) / Decimal("100")
-            if no_bid is None and yes_ask is not None:
-                no_bid = Decimal("1.00") - Decimal(str(yes_ask))
-            elif no_bid is None and msg.get("yes_ask") is not None:
-                no_bid = Decimal("1.00") - (Decimal(str(msg["yes_ask"])) / Decimal("100"))
-            yes_levels = (
-                [PriceLevel(price=Decimal(str(yes_bid)), count=Decimal("1"))]
-                if yes_bid is not None and Decimal(str(yes_bid)) > Decimal("0")
-                else []
-            )
-            no_levels = (
-                [PriceLevel(price=Decimal(str(no_bid)), count=Decimal("1"))]
-                if no_bid is not None and Decimal(str(no_bid)) > Decimal("0")
-                else []
-            )
-            if yes_levels or no_levels:
-                snap = OrderbookSnapshot(
-                    ticker=ticker,
-                    timestamp_ms=ts_ms,
-                    yes_bids=yes_levels,
-                    no_bids=no_levels,
-                )
-                self.set_snapshot(snap)
-                if self.on_orderbook:
-                    await self.on_orderbook(snap)
+            # Ticker messages carry top-of-book prices but no depth: never synthesize book levels
+            return
 
         elif msg_type == "fill":
             if self.on_fill:

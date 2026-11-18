@@ -413,3 +413,20 @@ async def test_llm_rolling_mid_trends_reducing_exits_and_full_slot_gate() -> Non
     assert parsed_exits[0].count == Decimal("3")
     assert parsed_exits[0].hold_to_expiry is False
 
+
+
+async def test_llm_total_edge_dollars_is_not_guessed_as_per_contract() -> None:
+    import json
+    from kalshi_poc.models import StrategyProvider
+    from kalshi_poc.strategy_ai import GeminiStrategy
+
+    strat = GeminiStrategy(
+        AppSettings(_env_file=None, strategy_provider=StrategyProvider.GEMINI, llm_api_key="k")
+    )
+    snap = _book(ticker="KXBTC-1", yes_bid="0.49", yes_count="50", no_bid="0.50", no_count="50")
+    raw = json.dumps([{"ticker": "KXBTC-1", "side": "bid", "count": "10",
+                       "limit_price": "0.50", "expected_edge_dollars": "0.15"}])
+    intents = strat._parse_batch_intents(raw, [snap], 10, positions_by_ticker={})
+    assert len(intents) == 1
+    assert intents[0].expected_edge_dollars == Decimal("0.15")
+    assert intents[0].expected_edge_per_contract == Decimal("0.0150")

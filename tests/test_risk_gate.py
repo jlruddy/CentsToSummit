@@ -38,7 +38,7 @@ def _make_intent(**overrides) -> TradeIntent:
         side=OrderSide.BID,
         count=Decimal("10"),
         limit_price=Decimal("0.52"),
-        expected_edge_dollars=Decimal("0.50"),
+        expected_edge_dollars=Decimal("0.80"),  # $0.08/contract across 10 contracts
         confidence=Decimal("0.80"),
         inference_latency_ms=5,
         rationale="Test signal",
@@ -180,7 +180,8 @@ def test_risk_gate_approves_intraday_hold_to_expiry_multi_contract_edge() -> Non
         expected_edge_per_contract=Decimal("0.04"),
         hold_to_expiry=True,
     )
-    eval_res = gate.evaluate(intent, snap, _make_portfolio())
+    # Single-leg fee eligibility now comes from exchange close_time, not the AI's flag
+    eval_res = gate.evaluate(intent, snap, _make_portfolio(), seconds_to_expiry=1800.0)
     assert eval_res.approved is True
     assert eval_res.estimated_entry_fee_dollars == Decimal("0.07")
     assert eval_res.estimated_round_trip_fee_dollars == Decimal("0.14")
@@ -296,3 +297,213 @@ def test_risk_gate_allows_reducing_exit_above_085_and_blocks_correlated_expiry_h
     assert res_corr.approved is False
     assert any("Correlated underlying + expiry_hour" in r for r in res_corr.rejection_reasons)
 
+
+
+# --- C4: risk-reducing exits pass the kill-switch and the order-rate limit ----------------
+
+
+def _long_position_portfolio(cash: str = "5000.00") -> PortfolioState:
+    p = _make_portfolio(cash)
+    p.positions["KXBTC-26NOV-T90000"] = Position(
+        ticker="KXBTC-26NOV-T90000",
+        net_contracts=Decimal("10"),
+        avg_entry_price=Decimal("0.45"),
+        cost_basis_dollars=Decimal("4.50"),
+    )
+    return p
+
+
+def test_kill_switch_blocks_entries_but_allows_reducing_exit() -> None:
+    gate = RiskGate(AppSettings(_env_file=None))
+    portfolio = _long_position_portfolio()
+    portfolio.kill_switch_tripped = True
+    exit_intent = _make_intent(side=OrderSide.ASK, count=Decimal("10"), limit_price=Decimal("0.50"))
+    res_exit = gate.evaluate(exit_intent, _make_snapshot(), portfolio)
+    assert res_exit.approved is True, res_exit.rejection_reasons
+
+    entry = _make_intent(ticker="KXETH-26NOV-T3000")
+    res_entry = gate.evaluate(entry, _make_snapshot("KXETH-26NOV-T3000"), portfolio)
+    assert res_entry.approved is False
+    assert any("Kill-switch" in r for r in res_entry.rejection_reasons)
+
+
+def test_rate_limit_does_not_block_reducing_exit() -> None:
+    gate = RiskGate(AppSettings(_env_file=None, max_orders_per_minute=1))
+    now_ms = 1700000000000
+    portfolio = _long_position_portfolio()
+    portfolio.recent_order_timestamps_ms = [now_ms - 1_000]
+    exit_intent = _make_intent(side=OrderSide.ASK, count=Decimal("10"), limit_price=Decimal("0.50"))
+    assert gate.evaluate(exit_intent, _make_snapshot(), portfolio, now_ms=now_ms).approved is True
+    entry = _make_intent(ticker="KXETH-26NOV-T3000")
+    res = gate.evaluate(entry, _make_snapshot("KXETH-26NOV-T3000"), portfolio, now_ms=now_ms)
+    assert any("rate limit" in r for r in res.rejection_reasons)
+
+
+def test_oversized_exit_is_not_treated_as_reducing() -> None:
+    gate = RiskGate(AppSettings(_env_file=None))
+    portfolio = _long_position_portfolio()
+    portfolio.kill_switch_tripped = True
+    # Selling 20 against a 10-lot long would open a 10-lot NO position -> must be blocked
+    flip = _make_intent(side=OrderSide.ASK, count=Decimal("20"), limit_price=Decimal("0.50"))
+    assert gate.evaluate(flip, _make_snapshot(), portfolio).approved is False
+
+
+# --- H1/H2/H3: edge units, AI-independent hold-to-expiry eligibility, KXFED -------------
+
+
+def _flat_book(ticker: str) -> OrderbookSnapshot:
+    return OrderbookSnapshot(
+        ticker=ticker,
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal("0.49"), count=Decimal("500"))],
+        no_bids=[PriceLevel(price=Decimal("0.50"), count=Decimal("500"))],  # YES ask 0.50
+    )
+
+
+def test_total_edge_is_never_reinterpreted_as_per_contract() -> None:
+    gate = RiskGate(AppSettings(_env_file=None, allowed_series_prefixes=["KXBTCD"]))
+    ticker = "KXBTCD-26NOV1717-T1"
+    # $0.15 total over 10 contracts = $0.015/c, below the ~$0.018/c entry fee -> must reject
+    intent = _make_intent(
+        ticker=ticker, count=Decimal("10"), limit_price=Decimal("0.50"),
+        expected_edge_dollars=Decimal("0.15"),
+    )
+    res = gate.evaluate(intent, _flat_book(ticker), _make_portfolio(), seconds_to_expiry=1800.0)
+    assert res.approved is False
+    assert any("Fee + slippage" in r or "Net edge" in r for r in res.rejection_reasons)
+
+
+def test_min_net_edge_is_per_contract_regardless_of_count() -> None:
+    settings = AppSettings(_env_file=None, min_net_edge_dollars=Decimal("0.02"))
+    gate = RiskGate(settings)
+    # $0.05/c gross - (0.036 RT fee + 0.01 slippage) = $0.004/c net < $0.02/c minimum
+    intent = _make_intent(expected_edge_dollars=Decimal("0.50"))
+    res = gate.evaluate(intent, _make_snapshot(), _make_portfolio())
+    assert res.approved is False
+    assert any("Net edge" in r for r in res.rejection_reasons)
+
+
+def test_ai_hold_to_expiry_flag_does_not_loosen_fee_accounting() -> None:
+    gate = RiskGate(AppSettings(_env_file=None, allowed_series_prefixes=["KXBTCD"]))
+    ticker = "KXBTCD-26NOV1717-T1"
+    # $0.04/c gross: passes with single-leg fee (0.018 + 0.005 slip) but not round-trip (0.036 + 0.005)
+    intent = _make_intent(
+        ticker=ticker, count=Decimal("10"), limit_price=Decimal("0.50"),
+        expected_edge_dollars=Decimal("0.40"), expected_edge_per_contract=Decimal("0.04"),
+        hold_to_expiry=True,
+    )
+    no_expiry = gate.evaluate(intent, _flat_book(ticker), _make_portfolio())
+    assert no_expiry.approved is False  # AI claimed hold_to_expiry, but no exchange close_time
+    far = gate.evaluate(intent, _flat_book(ticker), _make_portfolio(), seconds_to_expiry=86400.0)
+    assert far.approved is False
+    near = gate.evaluate(intent, _flat_book(ticker), _make_portfolio(), seconds_to_expiry=1800.0)
+    assert near.approved is True, near.rejection_reasons
+
+
+def test_kxfed_is_not_treated_as_intraday_binary() -> None:
+    gate = RiskGate(AppSettings(_env_file=None))
+    ticker = "KXFED-26DEC-T4.00"
+    intent = _make_intent(
+        ticker=ticker, count=Decimal("10"), limit_price=Decimal("0.50"),
+        expected_edge_dollars=Decimal("0.40"), expected_edge_per_contract=Decimal("0.04"),
+        hold_to_expiry=True,
+    )
+    # A Dec FOMC contract weeks away: round-trip fee applies -> $0.04/c edge is insufficient
+    res = gate.evaluate(intent, _flat_book(ticker), _make_portfolio(), seconds_to_expiry=30 * 86400.0)
+    assert res.approved is False
+    assert res.estimated_round_trip_fee_dollars == Decimal("0.36")
+
+
+def _book_with_yes_ask(yes_bid: str, yes_ask: str, ticker: str = "KXBTC-26NOV-T90000") -> OrderbookSnapshot:
+    return OrderbookSnapshot(
+        ticker=ticker,
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal(yes_bid), count=Decimal("100"))],
+        no_bids=[PriceLevel(price=Decimal("1") - Decimal(yes_ask), count=Decimal("100"))],
+    )
+
+
+def test_entry_too_close_to_take_profit_lock_is_rejected() -> None:
+    # Defaults: lock 0.85, trailing activation 0.08 -> entries must be below 0.77 on own side.
+    gate = RiskGate(AppSettings(_env_file=None))
+    res = gate.evaluate(
+        _make_intent(side=OrderSide.BID, count=Decimal("4"), limit_price=Decimal("0.80"),
+                     expected_edge_dollars=Decimal("0.40")),
+        _book_with_yes_ask("0.79", "0.80"),
+        _make_portfolio(),
+    )
+    assert res.approved is False
+    assert any("take-profit lock" in r for r in res.rejection_reasons)
+
+
+def test_short_entry_too_close_to_take_profit_lock_is_rejected() -> None:
+    # Selling YES at 0.20 opens a NO position bought at 0.80 -> also too close to the lock.
+    gate = RiskGate(AppSettings(_env_file=None))
+    res = gate.evaluate(
+        _make_intent(side=OrderSide.ASK, count=Decimal("4"), limit_price=Decimal("0.20"),
+                     expected_edge_dollars=Decimal("0.40")),
+        _book_with_yes_ask("0.20", "0.21"),
+        _make_portfolio(),
+    )
+    assert res.approved is False
+    assert any("take-profit lock" in r for r in res.rejection_reasons)
+
+
+def test_entry_below_lock_headroom_is_allowed() -> None:
+    gate = RiskGate(AppSettings(_env_file=None))
+    res = gate.evaluate(
+        _make_intent(side=OrderSide.BID, count=Decimal("4"), limit_price=Decimal("0.76"),
+                     expected_edge_dollars=Decimal("0.40")),
+        _book_with_yes_ask("0.75", "0.76"),
+        _make_portfolio(),
+    )
+    assert not any("take-profit lock" in r for r in res.rejection_reasons)
+    assert res.approved is True
+
+
+def test_reentry_cooldown_after_exit() -> None:
+    gate = RiskGate(AppSettings(_env_file=None, reentry_cooldown_secs=60))
+    portfolio = _make_portfolio()
+    ticker = "KXBTC-26NOV-T90000"
+    portfolio.positions[ticker] = Position(
+        ticker=ticker,
+        net_contracts=Decimal("10"),
+        avg_entry_price=Decimal("0.50"),
+        cost_basis_dollars=Decimal("5.00"),
+    )
+    t0 = 1700000000000
+    exit_res = gate.evaluate(
+        _make_intent(side=OrderSide.ASK, limit_price=Decimal("0.50"), reduce_only=True),
+        _make_snapshot(), portfolio, now_ms=t0,
+    )
+    assert exit_res.approved is True
+    portfolio.positions.pop(ticker)
+
+    soon = gate.evaluate(_make_intent(), _make_snapshot(), portfolio, now_ms=t0 + 30_000)
+    assert soon.approved is False
+    assert any("cooldown" in r.lower() for r in soon.rejection_reasons)
+
+    other = gate.evaluate(
+        _make_intent(ticker="KXETH-26NOV-T3000"), _make_snapshot("KXETH-26NOV-T3000"),
+        portfolio, now_ms=t0 + 30_000,
+    )
+    assert not any("cooldown" in r.lower() for r in other.rejection_reasons)
+
+    later = gate.evaluate(_make_intent(), _make_snapshot(), portfolio, now_ms=t0 + 61_000)
+    assert not any("cooldown" in r.lower() for r in later.rejection_reasons)
+
+
+def test_reentry_cooldown_zero_disables() -> None:
+    gate = RiskGate(AppSettings(_env_file=None, reentry_cooldown_secs=0))
+    portfolio = _make_portfolio()
+    ticker = "KXBTC-26NOV-T90000"
+    portfolio.positions[ticker] = Position(
+        ticker=ticker, net_contracts=Decimal("10"),
+        avg_entry_price=Decimal("0.50"), cost_basis_dollars=Decimal("5.00"),
+    )
+    t0 = 1700000000000
+    gate.evaluate(_make_intent(side=OrderSide.ASK, limit_price=Decimal("0.50")),
+                  _make_snapshot(), portfolio, now_ms=t0)
+    portfolio.positions.pop(ticker)
+    res = gate.evaluate(_make_intent(), _make_snapshot(), portfolio, now_ms=t0 + 1_000)
+    assert not any("cooldown" in r.lower() for r in res.rejection_reasons)

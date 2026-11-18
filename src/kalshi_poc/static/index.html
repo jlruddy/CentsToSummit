@@ -255,6 +255,55 @@
             <label class="block text-slate-400 mb-1">Max Slippage (cents)</label>
             <input type="text" x-model="config.max_slippage_cents" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
           </div>
+          <div class="col-span-2 pt-2 mt-1 border-t border-slate-800 text-slate-300 font-medium">
+            Exit Rules <span class="text-slate-500 font-normal">(prices on the position's own side; engine-managed, checked every tick)</span>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Exit Max Slippage (cents)</label>
+            <input type="text" x-model="config.exit_max_slippage_cents" placeholder="6" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Take-Profit Lock Price ($)</label>
+            <input type="text" x-model="config.take_profit_lock_price" placeholder="0.85" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Take-Profit Min Gain ($)</label>
+            <input type="text" x-model="config.take_profit_min_gain" placeholder="0.18" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Take-Profit Min Price ($)</label>
+            <input type="text" x-model="config.take_profit_min_price" placeholder="0.78" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Stop-Loss Drop ($)</label>
+            <input type="text" x-model="config.stop_loss_drop" placeholder="0.22" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Stop-Loss Off In Last (sec)</label>
+            <input type="text" x-model="config.stop_loss_disable_secs" placeholder="180" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div class="col-span-2 flex items-center justify-between bg-slate-950/70 border border-slate-800 rounded-lg px-3 py-2">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" x-model="config.trailing_stop_enabled" class="rounded bg-slate-950 border-slate-700 text-sky-500" />
+              <span class="font-medium text-slate-200">Trailing Stop</span>
+            </label>
+            <span class="text-slate-500">arms after the gain below, sells on a pullback of the distance from peak</span>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Trailing Activation Gain ($)</label>
+            <input type="text" x-model="config.trailing_stop_activation_gain" placeholder="0.08" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Trailing Distance ($)</label>
+            <input type="text" x-model="config.trailing_stop_distance" placeholder="0.06" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Re-entry Cooldown (s)</label>
+            <input type="number" min="0" x-model.number="config.reentry_cooldown_secs" placeholder="60" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div class="flex items-end text-slate-500 pb-1.5">
+            <span>Entries must be priced below <span class="font-mono" x-text="(Number(config.take_profit_lock_price) - Number(config.trailing_stop_activation_gain)).toFixed(2)"></span> (lock &minus; activation)</span>
+          </div>
         </div>
       </div>
 
@@ -736,6 +785,12 @@
             this.saveBanner = data.warning || 'Saved & hot-reloaded!';
             await this.loadStatus();
             setTimeout(() => { this.saveBanner = ''; }, 5000);
+          } else {
+            let detail = `Save failed (HTTP ${res.status})`;
+            try { detail = (await res.json()).detail || detail; } catch (e) {}
+            this.saveBanner = detail;
+            await this.loadConfig();
+            setTimeout(() => { this.saveBanner = ''; }, 8000);
           }
         },
 
@@ -746,6 +801,11 @@
             const data = await res.json();
             if (data.status) this.status = data.status;
             await this.loadConfig();
+          } else {
+            let detail = `Request failed (HTTP ${res.status})`;
+            try { detail = (await res.json()).detail || detail; } catch (e) {}
+            this.saveBanner = detail;
+            setTimeout(() => { this.saveBanner = ''; }, 8000);
           }
         },
 
