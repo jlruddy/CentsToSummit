@@ -63,6 +63,8 @@ class RiskGate:
         self.kill_switch_tripped: bool = False
         self.daily_loss: Decimal = Decimal("0.00")
         self.orders_this_minute: list[int] = []
+        # ticker -> timestamp_ms of the last approved risk-reducing exit (re-entry cooldown)
+        self.last_exit_ms: dict[str, int] = {}
 
     def update_settings(self, settings: AppSettings) -> None:
         self._settings = settings
@@ -191,6 +193,16 @@ class RiskGate:
                             f"Correlated underlying + expiry_hour position already active on {active_t} ({target_hour_key}); stacking correlated strikes blocked"
                         )
                         break
+
+        if not is_reducing_exit and s.reentry_cooldown_secs > 0:
+            last_exit = self.last_exit_ms.get(intent.ticker)
+            if last_exit is not None:
+                elapsed_s = (ts - last_exit) / 1000.0
+                if 0 <= elapsed_s < s.reentry_cooldown_secs:
+                    reasons.append(
+                        f"Re-entry cooldown: exited {intent.ticker} {elapsed_s:.0f}s ago "
+                        f"(< {s.reentry_cooldown_secs}s)"
+                    )
 
         if intent.ticker in portfolio.resting_order_tickers:
             reasons.append(
@@ -335,6 +347,15 @@ class RiskGate:
                 f"Effective price ${effective_fill_price:.4f} (YES ${est_fill_price:.4f}, limit ${effective_limit_price:.4f}) outside allowed [$0.15, $0.85] band"
             )
 
+        # Entries must leave room to profit before the take-profit lock force-sells them:
+        # own-side price must stay below lock_price - trailing activation gain.
+        entry_ceiling = s.take_profit_lock_price - s.trailing_stop_activation_gain
+        if not is_reducing_exit and max(effective_fill_price, effective_limit_price) >= entry_ceiling:
+            reasons.append(
+                f"Entry ${max(effective_fill_price, effective_limit_price):.4f} too close to take-profit lock "
+                f"${s.take_profit_lock_price:.2f} (must be < ${entry_ceiling:.2f})"
+            )
+
         # 5. Hard Equity Floor (EQUITY_FLOOR)
         proposed_collateral = Decimal("0.00") if is_reducing_exit else (proposed_notional + entry_fee)
         worst_case_equity_after = (
@@ -349,6 +370,8 @@ class RiskGate:
             )
 
         approved = len(reasons) == 0
+        if approved and is_reducing_exit:
+            self.last_exit_ms[intent.ticker] = ts
         logger.info(
             "[RISK_GATE] ticker=%s approved=%s notional=$%.2f effective_max_pos=$%.2f (dynamic=%s, risk_pct=%.0f%%)",
             intent.ticker,

@@ -412,3 +412,98 @@ def test_kxfed_is_not_treated_as_intraday_binary() -> None:
     res = gate.evaluate(intent, _flat_book(ticker), _make_portfolio(), seconds_to_expiry=30 * 86400.0)
     assert res.approved is False
     assert res.estimated_round_trip_fee_dollars == Decimal("0.36")
+
+
+def _book_with_yes_ask(yes_bid: str, yes_ask: str, ticker: str = "KXBTC-26NOV-T90000") -> OrderbookSnapshot:
+    return OrderbookSnapshot(
+        ticker=ticker,
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal(yes_bid), count=Decimal("100"))],
+        no_bids=[PriceLevel(price=Decimal("1") - Decimal(yes_ask), count=Decimal("100"))],
+    )
+
+
+def test_entry_too_close_to_take_profit_lock_is_rejected() -> None:
+    # Defaults: lock 0.85, trailing activation 0.08 -> entries must be below 0.77 on own side.
+    gate = RiskGate(AppSettings(_env_file=None))
+    res = gate.evaluate(
+        _make_intent(side=OrderSide.BID, count=Decimal("4"), limit_price=Decimal("0.80"),
+                     expected_edge_dollars=Decimal("0.40")),
+        _book_with_yes_ask("0.79", "0.80"),
+        _make_portfolio(),
+    )
+    assert res.approved is False
+    assert any("take-profit lock" in r for r in res.rejection_reasons)
+
+
+def test_short_entry_too_close_to_take_profit_lock_is_rejected() -> None:
+    # Selling YES at 0.20 opens a NO position bought at 0.80 -> also too close to the lock.
+    gate = RiskGate(AppSettings(_env_file=None))
+    res = gate.evaluate(
+        _make_intent(side=OrderSide.ASK, count=Decimal("4"), limit_price=Decimal("0.20"),
+                     expected_edge_dollars=Decimal("0.40")),
+        _book_with_yes_ask("0.20", "0.21"),
+        _make_portfolio(),
+    )
+    assert res.approved is False
+    assert any("take-profit lock" in r for r in res.rejection_reasons)
+
+
+def test_entry_below_lock_headroom_is_allowed() -> None:
+    gate = RiskGate(AppSettings(_env_file=None))
+    res = gate.evaluate(
+        _make_intent(side=OrderSide.BID, count=Decimal("4"), limit_price=Decimal("0.76"),
+                     expected_edge_dollars=Decimal("0.40")),
+        _book_with_yes_ask("0.75", "0.76"),
+        _make_portfolio(),
+    )
+    assert not any("take-profit lock" in r for r in res.rejection_reasons)
+    assert res.approved is True
+
+
+def test_reentry_cooldown_after_exit() -> None:
+    gate = RiskGate(AppSettings(_env_file=None, reentry_cooldown_secs=60))
+    portfolio = _make_portfolio()
+    ticker = "KXBTC-26NOV-T90000"
+    portfolio.positions[ticker] = Position(
+        ticker=ticker,
+        net_contracts=Decimal("10"),
+        avg_entry_price=Decimal("0.50"),
+        cost_basis_dollars=Decimal("5.00"),
+    )
+    t0 = 1700000000000
+    exit_res = gate.evaluate(
+        _make_intent(side=OrderSide.ASK, limit_price=Decimal("0.50"), reduce_only=True),
+        _make_snapshot(), portfolio, now_ms=t0,
+    )
+    assert exit_res.approved is True
+    portfolio.positions.pop(ticker)
+
+    soon = gate.evaluate(_make_intent(), _make_snapshot(), portfolio, now_ms=t0 + 30_000)
+    assert soon.approved is False
+    assert any("cooldown" in r.lower() for r in soon.rejection_reasons)
+
+    other = gate.evaluate(
+        _make_intent(ticker="KXETH-26NOV-T3000"), _make_snapshot("KXETH-26NOV-T3000"),
+        portfolio, now_ms=t0 + 30_000,
+    )
+    assert not any("cooldown" in r.lower() for r in other.rejection_reasons)
+
+    later = gate.evaluate(_make_intent(), _make_snapshot(), portfolio, now_ms=t0 + 61_000)
+    assert not any("cooldown" in r.lower() for r in later.rejection_reasons)
+
+
+def test_reentry_cooldown_zero_disables() -> None:
+    gate = RiskGate(AppSettings(_env_file=None, reentry_cooldown_secs=0))
+    portfolio = _make_portfolio()
+    ticker = "KXBTC-26NOV-T90000"
+    portfolio.positions[ticker] = Position(
+        ticker=ticker, net_contracts=Decimal("10"),
+        avg_entry_price=Decimal("0.50"), cost_basis_dollars=Decimal("5.00"),
+    )
+    t0 = 1700000000000
+    gate.evaluate(_make_intent(side=OrderSide.ASK, limit_price=Decimal("0.50")),
+                  _make_snapshot(), portfolio, now_ms=t0)
+    portfolio.positions.pop(ticker)
+    res = gate.evaluate(_make_intent(), _make_snapshot(), portfolio, now_ms=t0 + 1_000)
+    assert not any("cooldown" in r.lower() for r in res.rejection_reasons)

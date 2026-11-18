@@ -737,6 +737,9 @@ class _LLMStrategyBase(BaseStrategy):
         payload = {
             "remaining_deployable_budget_dollars": f"{deployable:.2f}",
             "max_position_dollars_per_market": f"{effective_max_pos:.2f}",
+            # New entries must be priced below this on their own side (YES price for bids,
+            # 1 - limit for asks); the risk gate rejects anything at or above it.
+            "max_entry_price_own_side": f"{self._entry_ceiling():.2f}",
             "open_positions": open_positions,
             "markets": markets_payload,
         }
@@ -744,6 +747,10 @@ class _LLMStrategyBase(BaseStrategy):
             "Evaluate all markets below in one pass and return a JSON array of TradeIntent objects "
             f"(or [] if all are HOLD):\n{json.dumps(payload)}"
         )
+
+    def _entry_ceiling(self) -> Decimal:
+        """Highest own-side entry price that still leaves room before the take-profit lock."""
+        return self.settings.take_profit_lock_price - self.settings.trailing_stop_activation_gain
 
     def _system_prompt(self) -> str:
         override = self.settings.system_prompt_override.strip()
@@ -929,6 +936,14 @@ class _LLMStrategyBase(BaseStrategy):
                     and Decimal("0.15") <= (Decimal("1.00") - limit_px) <= Decimal("0.85")
                 ):
                     reject(item, "FILTERED", f"Limit {limit_px} outside [$0.15, $0.85] band")
+                    continue
+                own_side_px = limit_px if side == OrderSide.BID else (Decimal("1.00") - limit_px)
+                if not is_reducing_exit and own_side_px >= self._entry_ceiling():
+                    reject(
+                        item,
+                        "FILTERED",
+                        f"Entry {own_side_px} at/above max_entry_price_own_side {self._entry_ceiling():.2f}",
+                    )
                     continue
 
                 count_dec = Decimal(str(item["count"]))

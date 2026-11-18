@@ -57,6 +57,9 @@ Upload the `.pem` public key in your Kalshi Demo (or Production) account setting
   - *Trailing stop* arms once the position is up by the Activation Gain, then sells if the price falls the Distance below its peak.
   - *Stop-loss* sells after the Drop and is disabled in the final seconds before close.
   - Exits use the wider Exit Max Slippage so a wide spread does not block them. Peaks are tracked in memory, from once-per-tick prices, and reset on restart.
+- **Entry guards (risk gate):**
+  - *Lock headroom:* a new entry must be priced below Lock Price − Trailing Activation Gain on its own side (0.77 with defaults). Otherwise the take-profit lock would sell it right away for little or no gain. The AI is told this ceiling in its prompt.
+  - *Re-entry cooldown:* after any approved exit, new entries in that market are blocked for `REENTRY_COOLDOWN_SECS` (default 60, 0 = off), which stops exit-then-re-enter churn.
 - **Live trading gate:** `execution_mode=live` is rejected by the server (UI, API, and Start) unless the process was launched with `--confirm-live`.
 - **Access control:** The control panel only answers requests whose `Host` is `127.0.0.1`, `localhost`, or `::1`, and rejects cross-site writes and WebSocket connections (by `Origin`). If you serve it under another hostname, add it to `WEB_ALLOWED_HOSTS` (JSON array).
 - **Hot-Reloadable Config Cards:** Edit Execution Mode (`paused`, `shadow`, `demo`, `live`), Capital & Equity Floor, Risk & Microstructure Limits, Tax-Hygiene Series Allowlist, and AI Strategy Provider (`stub_momentum`, `anthropic`, `gemini`, `ollama_local`), then click **Save & Apply** without dropping active WebSocket feeds.

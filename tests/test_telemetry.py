@@ -165,3 +165,21 @@ async def test_parquet_export_is_complete_and_typed(tmp_path: Path) -> None:
     assert str(tbl.schema.field("timestamp_ms").type) == "int64"
     assert tbl.column("timestamp_ms")[0].as_py() == 0  # oldest first
     assert pq.read_table(files["llm_calls.parquet"]).num_rows == 0
+
+
+def test_entry_at_or_above_lock_ceiling_is_filtered_and_ceiling_in_prompt() -> None:
+    strat = _strat()
+    snap = OrderbookSnapshot(
+        ticker="KXBTC-1",
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal("0.79"), count=Decimal("50"))],
+        no_bids=[PriceLevel(price=Decimal("0.20"), count=Decimal("50"))],  # ask 0.80
+    )
+    raw = json.dumps([{"ticker": "KXBTC-1", "side": "bid", "count": "2", "limit_price": "0.80",
+                       "expected_edge_per_contract": "0.06"}])
+    intents, rejections = strat._parse_batch_intents_detailed(raw, [snap], 10, positions_by_ticker={})
+    assert intents == []
+    assert rejections[0]["status"] == "FILTERED"
+    assert "max_entry_price_own_side" in rejections[0]["reason"]
+    prompt = strat._build_batch_prompt([snap], _portfolio(), {})
+    assert '"max_entry_price_own_side": "0.77"' in prompt

@@ -64,6 +64,8 @@ class AppSettings(BaseSettings):
         default=Decimal("0.08"), ge=Decimal("0"), le=Decimal("1")
     )
     trailing_stop_distance: Decimal = Field(default=Decimal("0.06"), gt=Decimal("0"), le=Decimal("1"))
+    # After any approved exit, block new entries in that same market for this many seconds (0 = off).
+    reentry_cooldown_secs: int = Field(default=60, ge=0, le=3600)
 
     # Tax-Hygiene Allowlist & Discovery Priority
     allowed_series_prefixes: list[str] = Field(
@@ -176,7 +178,7 @@ class ConfigManager:
         self._settings = self._load_initial()
 
     def _load_initial(self) -> AppSettings:
-        base = AppSettings()
+        base = AppSettings(_env_file=self.env_path)
         if self.config_json_path.exists():
             try:
                 data = json.loads(self.config_json_path.read_text(encoding="utf-8"))
@@ -299,6 +301,7 @@ class ConfigManager:
             f"TRAILING_STOP_ENABLED={str(s.trailing_stop_enabled).lower()}",
             f"TRAILING_STOP_ACTIVATION_GAIN={s.trailing_stop_activation_gain}",
             f"TRAILING_STOP_DISTANCE={s.trailing_stop_distance}",
+            f"REENTRY_COOLDOWN_SECS={s.reentry_cooldown_secs}",
             f"ALLOWED_SERIES_PREFIXES={json.dumps(s.allowed_series_prefixes)}",
             f"ENFORCE_FINANCIAL_ONLY={str(s.enforce_financial_only).lower()}",
             f"PREFER_15M_TURNOVER={str(s.prefer_15m_turnover).lower()}",

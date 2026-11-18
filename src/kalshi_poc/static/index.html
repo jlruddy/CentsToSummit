@@ -297,6 +297,13 @@
             <label class="block text-slate-400 mb-1">Trailing Distance ($)</label>
             <input type="text" x-model="config.trailing_stop_distance" placeholder="0.06" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
           </div>
+          <div>
+            <label class="block text-slate-400 mb-1">Re-entry Cooldown (s)</label>
+            <input type="number" min="0" x-model.number="config.reentry_cooldown_secs" placeholder="60" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
+          <div class="flex items-end text-slate-500 pb-1.5">
+            <span>Entries must be priced below <span class="font-mono" x-text="(Number(config.take_profit_lock_price) - Number(config.trailing_stop_activation_gain)).toFixed(2)"></span> (lock &minus; activation)</span>
+          </div>
         </div>
       </div>
 
