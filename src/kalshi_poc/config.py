@@ -49,6 +49,21 @@ class AppSettings(BaseSettings):
     max_orders_per_minute: int = Field(default=10, ge=1, le=600)
     min_net_edge_dollars: Decimal = Field(default=Decimal("0.02"), ge=Decimal("0"))
     max_slippage_cents: Decimal = Field(default=Decimal("3"), ge=Decimal("0"))
+    # Risk-reducing exits may cross wider books than entries (a wide spread must not trap a position)
+    exit_max_slippage_cents: Decimal = Field(default=Decimal("6"), ge=Decimal("0"))
+
+    # Deterministic exits (engine-side; Kalshi event contracts have no native stop orders).
+    # Prices are on the position's own side: YES bid for YES positions, NO bid for NO positions.
+    take_profit_min_gain: Decimal = Field(default=Decimal("0.18"), ge=Decimal("0"), le=Decimal("1"))
+    take_profit_min_price: Decimal = Field(default=Decimal("0.78"), gt=Decimal("0"), lt=Decimal("1"))
+    take_profit_lock_price: Decimal = Field(default=Decimal("0.85"), gt=Decimal("0"), lt=Decimal("1"))
+    stop_loss_drop: Decimal = Field(default=Decimal("0.22"), gt=Decimal("0"), le=Decimal("1"))
+    stop_loss_disable_secs: int = Field(default=180, ge=0, le=3600)
+    trailing_stop_enabled: bool = Field(default=True)
+    trailing_stop_activation_gain: Decimal = Field(
+        default=Decimal("0.08"), ge=Decimal("0"), le=Decimal("1")
+    )
+    trailing_stop_distance: Decimal = Field(default=Decimal("0.06"), gt=Decimal("0"), le=Decimal("1"))
 
     # Tax-Hygiene Allowlist & Discovery Priority
     allowed_series_prefixes: list[str] = Field(
@@ -275,6 +290,15 @@ class ConfigManager:
             f"MAX_ORDERS_PER_MINUTE={s.max_orders_per_minute}",
             f"MIN_NET_EDGE_DOLLARS={s.min_net_edge_dollars}",
             f"MAX_SLIPPAGE_CENTS={s.max_slippage_cents}",
+            f"EXIT_MAX_SLIPPAGE_CENTS={s.exit_max_slippage_cents}",
+            f"TAKE_PROFIT_MIN_GAIN={s.take_profit_min_gain}",
+            f"TAKE_PROFIT_MIN_PRICE={s.take_profit_min_price}",
+            f"TAKE_PROFIT_LOCK_PRICE={s.take_profit_lock_price}",
+            f"STOP_LOSS_DROP={s.stop_loss_drop}",
+            f"STOP_LOSS_DISABLE_SECS={s.stop_loss_disable_secs}",
+            f"TRAILING_STOP_ENABLED={str(s.trailing_stop_enabled).lower()}",
+            f"TRAILING_STOP_ACTIVATION_GAIN={s.trailing_stop_activation_gain}",
+            f"TRAILING_STOP_DISTANCE={s.trailing_stop_distance}",
             f"ALLOWED_SERIES_PREFIXES={json.dumps(s.allowed_series_prefixes)}",
             f"ENFORCE_FINANCIAL_ONLY={str(s.enforce_financial_only).lower()}",
             f"PREFER_15M_TURNOVER={str(s.prefer_15m_turnover).lower()}",

@@ -223,7 +223,8 @@ class RiskGate:
         est_slippage = Decimal("0.00")
         entry_fee = calculate_taker_fee(intent.count, intent.limit_price)
         round_trip_fee = entry_fee * Decimal("2")
-        max_slip_dollars = (s.max_slippage_cents / Decimal("100")).quantize(Decimal("0.0001"))
+        slip_limit_cents = s.exit_max_slippage_cents if is_reducing_exit else s.max_slippage_cents
+        max_slip_dollars = (slip_limit_cents / Decimal("100")).quantize(Decimal("0.0001"))
 
         if snapshot is None:
             reasons.append(f"No live orderbook snapshot available for {intent.ticker}")
@@ -263,10 +264,10 @@ class RiskGate:
 
                 if (
                     not skip_slippage_bands
-                    and walk.slippage_cents_per_contract > s.max_slippage_cents
+                    and walk.slippage_cents_per_contract > slip_limit_cents
                 ):
                     reasons.append(
-                        f"Estimated slippage {walk.slippage_cents_per_contract}c exceeds max {s.max_slippage_cents}c"
+                        f"Estimated slippage {walk.slippage_cents_per_contract}c exceeds max {slip_limit_cents}c"
                     )
 
                 if not is_reducing_exit:

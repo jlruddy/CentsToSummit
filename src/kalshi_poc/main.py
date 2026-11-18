@@ -103,6 +103,8 @@ class TradingEngine:
         # C4/H6: exit management while paused/killed, exit throttling, persisted risk state
         self._exit_mode_when_paused: ExecutionMode | None = None
         self._last_exit_attempt_mono: dict[str, float] = {}
+        # Trailing stop: ticker -> ((avg_entry, direction), peak exit-side price seen)
+        self._trail_state: dict[str, tuple[tuple[Decimal, int], Decimal]] = {}
         self._persisted_kill_switch: bool | None = None
         self._baseline_key: tuple[str, str] | None = None
         self._engine_lock = asyncio.Lock()
@@ -1108,7 +1110,14 @@ class TradingEngine:
     async def _evaluate_deterministic_exits(
         self, s: AppSettings, now_utc: datetime, mode: ExecutionMode | None = None
     ) -> list[TradeIntent]:
-        """Evaluate open positions every 1s for Take-Profit Lock or Hard Stop-Loss exits."""
+        """Evaluate open positions every tick for take-profit, trailing-stop and stop-loss exits.
+
+        All prices are on the position's own side: the YES bid for YES positions and the NO bid
+        (1 - YES ask) for NO positions, i.e. the price the position can be sold at right now.
+        """
+        for t in list(self._trail_state):
+            if t not in self.portfolio.positions:
+                self._trail_state.pop(t, None)
         if self.ws_client is None or not self.portfolio.positions:
             return []
 
@@ -1126,33 +1135,39 @@ class TradingEngine:
             if snap is None or snap.best_yes_bid is None or snap.best_yes_ask is None:
                 continue
 
-            if pos.net_contracts > Decimal("0"):
-                best_bid = snap.best_yes_bid
-                unrealized_gain = best_bid - pos.avg_entry_price
-                drop_below_entry = pos.avg_entry_price - best_bid
-                take_profit = (
-                    unrealized_gain >= Decimal("0.18") and best_bid >= Decimal("0.78")
-                ) or best_bid >= Decimal("0.85")
-                stop_loss = drop_below_entry >= Decimal("0.22") and (
-                    close_in is None or close_in > 180.0
-                )
+            is_long = pos.net_contracts > Decimal("0")
+            if is_long:
+                sell_px = snap.best_yes_bid
+                entry_px = pos.avg_entry_price
                 exit_side = OrderSide.ASK
-                raw_exit_px = best_bid
+                raw_exit_px = snap.best_yes_bid
             else:
-                best_ask = snap.best_yes_ask
-                best_no_bid = Decimal("1.00") - best_ask
-                unrealized_gain = pos.avg_entry_price - best_ask
-                drop_below_entry = best_ask - pos.avg_entry_price
-                take_profit = (
-                    unrealized_gain >= Decimal("0.18") and best_no_bid >= Decimal("0.78")
-                ) or best_no_bid >= Decimal("0.85")
-                stop_loss = drop_below_entry >= Decimal("0.22") and (
-                    close_in is None or close_in > 180.0
-                )
+                sell_px = Decimal("1.00") - snap.best_yes_ask
+                entry_px = Decimal("1.00") - pos.avg_entry_price
                 exit_side = OrderSide.BID
-                raw_exit_px = best_ask
+                raw_exit_px = snap.best_yes_ask
+            unrealized_gain = sell_px - entry_px
+            drop_below_entry = entry_px - sell_px
 
-            if not (take_profit or stop_loss):
+            # Trailing stop: track the best sell price since this position was opened
+            trail_key = (pos.avg_entry_price, 1 if is_long else -1)
+            state = self._trail_state.get(ticker)
+            peak = sell_px if state is None or state[0] != trail_key else max(state[1], sell_px)
+            self._trail_state[ticker] = (trail_key, peak)
+
+            take_profit = (
+                unrealized_gain >= s.take_profit_min_gain and sell_px >= s.take_profit_min_price
+            ) or sell_px >= s.take_profit_lock_price
+            trailing_stop = (
+                s.trailing_stop_enabled
+                and (peak - entry_px) >= s.trailing_stop_activation_gain
+                and (peak - sell_px) >= s.trailing_stop_distance
+            )
+            stop_loss = drop_below_entry >= s.stop_loss_drop and (
+                close_in is None or close_in > float(s.stop_loss_disable_secs)
+            )
+
+            if not (take_profit or trailing_stop or stop_loss):
                 continue
             now_mono = time.monotonic()
             last_try = self._last_exit_attempt_mono.get(ticker)
@@ -1169,10 +1184,16 @@ class TradingEngine:
             )
             edge_per_c = max(Decimal("0.0500"), abs(unrealized_gain)).quantize(Decimal("0.0001"))
             total_edge = (edge_per_c * exit_count).quantize(Decimal("0.01"))
-            reason_tag = "TAKE_PROFIT_LOCK" if take_profit else "HARD_STOP_LOSS"
+            reason_tag = (
+                "TAKE_PROFIT_LOCK"
+                if take_profit
+                else "TRAILING_STOP"
+                if trailing_stop
+                else "HARD_STOP_LOSS"
+            )
             rationale = (
-                f"Deterministic {reason_tag}: entry=${pos.avg_entry_price:.4f} "
-                f"exit=${limit_px:.4f} unrealized={unrealized_gain:+.4f}/c"
+                f"Deterministic {reason_tag}: entry=${entry_px:.4f} sell=${sell_px:.4f} "
+                f"peak=${peak:.4f} unrealized={unrealized_gain:+.4f}/c"
             )
             intent = TradeIntent(
                 timestamp_ms=ts_ms,
@@ -1187,6 +1208,7 @@ class TradingEngine:
                 inference_latency_ms=0,
                 rationale=rationale,
                 provider="deterministic_exit",
+                reduce_only=True,
             )
             logger.info(
                 "[EXIT] %s ticker=%s side=%s count=%s price=$%s unrealized=%+.4f/c",
@@ -1797,6 +1819,7 @@ class TradingEngine:
                 inference_latency_ms=0,
                 rationale=f"Emergency flatten {qty_open} @ inside ${px:.4f}",
                 provider="emergency_flatten",
+                reduce_only=True,
             )
             d = intent.model_dump(mode="json")
             d["action"] = "BUY" if side == OrderSide.BID else "SELL"

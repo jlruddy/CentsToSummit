@@ -348,6 +348,8 @@ class V2CreateOrderRequest(BaseModel):
     self_trade_prevention_type: SelfTradePrevention = SelfTradePrevention.TAKER_AT_CROSS
     client_order_id: str = Field(default_factory=new_client_order_id)
     exchange_index: int | None = None
+    # Exchange-enforced: may only shrink a position (Kalshi requires immediate_or_cancel)
+    reduce_only: bool | None = None
 
     @classmethod
     def from_intent(cls, intent: TradeIntent) -> V2CreateOrderRequest:
@@ -366,6 +368,11 @@ class V2CreateOrderRequest(BaseModel):
             time_in_force=intent.time_in_force,
             self_trade_prevention_type=SelfTradePrevention.TAKER_AT_CROSS,
             client_order_id=new_client_order_id(),
+            reduce_only=(
+                True
+                if intent.reduce_only and intent.time_in_force == TimeInForce.IMMEDIATE_OR_CANCEL
+                else None
+            ),
         )
 
 
@@ -389,6 +396,7 @@ class TradeIntent(BaseModel):
     rationale: str
     provider: str
     time_in_force: TimeInForce = TimeInForce.IMMEDIATE_OR_CANCEL
+    reduce_only: bool = False
 
     @field_validator(
         "count",

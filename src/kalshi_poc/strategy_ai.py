@@ -371,6 +371,7 @@ class StubMomentumStrategy(BaseStrategy):
                                 f"unrealized={unrealized:+.4f}/c, imb={imbalance:+.2f})"
                             ),
                             provider=StrategyProvider.STUB_MOMENTUM.value,
+                            reduce_only=True,
                         )
                         detail = intent.model_dump(mode="json")
                         detail["action"] = "SELL"
@@ -410,6 +411,7 @@ class StubMomentumStrategy(BaseStrategy):
                                 f"unrealized={unrealized:+.4f}/c, imb={imbalance:+.2f})"
                             ),
                             provider=StrategyProvider.STUB_MOMENTUM.value,
+                            reduce_only=True,
                         )
                         detail = intent.model_dump(mode="json")
                         detail["action"] = "BUY"
@@ -952,6 +954,7 @@ class _LLMStrategyBase(BaseStrategy):
                     expected_edge_dollars=total_edge,
                     expected_edge_per_contract=edge_per_c,
                     hold_to_expiry=False if is_reducing_exit else bool(item.get("hold_to_expiry", False)),
+                    reduce_only=is_reducing_exit,
                     confidence=Decimal(str(item.get("confidence", "0.50"))),
                     inference_latency_ms=latency_ms,
                     rationale=str(item.get("rationale", "LLM batch signal"))[:400],
