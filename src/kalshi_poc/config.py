@@ -41,16 +41,21 @@ class AppSettings(BaseSettings):
 
     # Risk & Microstructure Limits
     max_position_dollars_per_market: Decimal = Field(default=Decimal("250.00"), gt=Decimal("0"))
+    dynamic_sizing_enabled: bool = Field(default=True)
+    house_money_risk_pct: Decimal = Field(
+        default=Decimal("0.20"), gt=Decimal("0"), le=Decimal("1")
+    )
     max_open_markets: int = Field(default=5, ge=1, le=100)
     max_orders_per_minute: int = Field(default=10, ge=1, le=600)
     min_net_edge_dollars: Decimal = Field(default=Decimal("0.02"), ge=Decimal("0"))
     max_slippage_cents: Decimal = Field(default=Decimal("3"), ge=Decimal("0"))
 
-    # Tax-Hygiene Allowlist
+    # Tax-Hygiene Allowlist & Discovery Priority
     allowed_series_prefixes: list[str] = Field(
         default_factory=lambda: ["KXBTC", "KXETH", "KXINX", "KXFED", "KXCPI"]
     )
     enforce_financial_only: bool = Field(default=True)
+    prefer_15m_turnover: bool = Field(default=True)
     subscribed_tickers: list[str] = Field(default_factory=list)
 
     # AI Strategy Settings
@@ -237,12 +242,15 @@ class ConfigManager:
             f"DAILY_DRAWDOWN_KILL_SWITCH={s.daily_drawdown_kill_switch}",
             f"POLL_INTERVAL_MS={s.poll_interval_ms}",
             f"MAX_POSITION_DOLLARS_PER_MARKET={s.max_position_dollars_per_market}",
+            f"DYNAMIC_SIZING_ENABLED={str(s.dynamic_sizing_enabled).lower()}",
+            f"HOUSE_MONEY_RISK_PCT={s.house_money_risk_pct}",
             f"MAX_OPEN_MARKETS={s.max_open_markets}",
             f"MAX_ORDERS_PER_MINUTE={s.max_orders_per_minute}",
             f"MIN_NET_EDGE_DOLLARS={s.min_net_edge_dollars}",
             f"MAX_SLIPPAGE_CENTS={s.max_slippage_cents}",
             f"ALLOWED_SERIES_PREFIXES={json.dumps(s.allowed_series_prefixes)}",
             f"ENFORCE_FINANCIAL_ONLY={str(s.enforce_financial_only).lower()}",
+            f"PREFER_15M_TURNOVER={str(s.prefer_15m_turnover).lower()}",
             f"SUBSCRIBED_TICKERS={json.dumps(s.subscribed_tickers)}",
             f"STRATEGY_PROVIDER={s.strategy_provider.value}",
             f"LLM_API_KEY={s.llm_api_key}",

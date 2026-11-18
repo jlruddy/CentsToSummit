@@ -32,7 +32,7 @@ from kalshi_poc.models import (
     V2CreateOrderRequest,
 )
 from kalshi_poc.risk_gate import RiskGate
-from kalshi_poc.simulator import ShadowSimulator, calculate_taker_fee
+from kalshi_poc.simulator import ShadowSimulator, calculate_taker_fee, walk_book
 from kalshi_poc.strategy_ai import BaseStrategy, StrategyFactory
 from kalshi_poc.telemetry import TelemetryManager, export_sqlite_to_parquet
 from kalshi_poc.web_server import create_app
@@ -81,10 +81,12 @@ class TradingEngine:
         self._last_portfolio_sync_monotonic: float = 0.0
         self._last_resting_reap_monotonic: float = 0.0
         self._last_quarter_bucket: int = int(time.time()) // 900
+        self._last_rollover_03_bucket: int = int(time.time()) // 900
         self._resting_order_first_seen: dict[str, float] = {}
         self._initial_sync_done: bool = False
         self._funded_shards: set[int] = set()
         self._engine_lock = asyncio.Lock()
+        self._sync_lock = asyncio.Lock()
         self.session_start_ts: int = int(time.time() * 1000)
         self.session_starting_equity: Decimal = s.initial_capital
 
@@ -171,6 +173,7 @@ class TradingEngine:
             elif self.ws_client is not None and (
                 old_s.subscribed_tickers != new_s.subscribed_tickers
                 or old_s.allowed_series_prefixes != new_s.allowed_series_prefixes
+                or old_s.prefer_15m_turnover != new_s.prefer_15m_turnover
             ):
                 loop.create_task(self._refresh_subscriptions(new_s))
 
@@ -270,8 +273,13 @@ class TradingEngine:
 
     async def sync_balance_from_api(self) -> None:
         """Sync portfolio cash_balance and active non-expired positions from Kalshi API."""
-        if self.rest_client is None or self.rest_client.signer is None:
+        if self.rest_client is None or self.rest_client.signer is None or self._sync_lock.locked():
             return
+        async with self._sync_lock:
+            await self._sync_balance_from_api_locked()
+
+    async def _sync_balance_from_api_locked(self) -> None:
+        assert self.rest_client is not None
         now_utc = datetime.now(timezone.utc)
         now_mono = time.monotonic()
         self._last_portfolio_sync_monotonic = now_mono
@@ -387,33 +395,41 @@ class TradingEngine:
         seen_series: set[str] = set()
         seen_prefixes: set[str] = set()
 
+        def _add_candidate(t: str, *, require_distinct_series: bool = True) -> None:
+            if len(merged) >= 6 or t in merged:
+                return
+            pref = t.strip().upper().split("-", 1)[0]
+            sk = self._ticker_series_key(t)
+            if pref in seen_prefixes:
+                return
+            if require_distinct_series and sk in seen_series:
+                return
+            seen_prefixes.add(pref)
+            seen_series.add(sk)
+            merged.append(t)
+
+        if s.prefer_15m_turnover:
+            # Bind fresh 15M contracts first (displacing temporary hourly rollover fallbacks)
+            for t in discovered:
+                if t.strip().upper().split("-", 1)[0].endswith("15M"):
+                    _add_candidate(t, require_distinct_series=True)
+            for t in self.ws_client.tickers:
+                if t.strip().upper().split("-", 1)[0].endswith("15M"):
+                    _add_candidate(t, require_distinct_series=True)
+
         # Keep existing healthy subscriptions, at most 1 per series_ticker
         for t in self.ws_client.tickers:
-            pref = t.strip().upper().split("-", 1)[0]
-            if pref not in seen_prefixes and len(merged) < 6:
-                seen_prefixes.add(pref)
-                seen_series.add(self._ticker_series_key(t))
-                merged.append(t)
+            _add_candidate(t, require_distinct_series=True)
 
         # Pass 1: Add discovered tickers from distinct underlying assets
         for t in discovered:
-            if len(merged) >= 6:
-                break
-            sk = self._ticker_series_key(t)
-            pref = t.strip().upper().split("-", 1)[0]
-            if t not in merged and sk not in seen_series and pref not in seen_prefixes:
-                seen_series.add(sk)
-                seen_prefixes.add(pref)
-                merged.append(t)
+            _add_candidate(t, require_distinct_series=True)
 
         # Pass 2: Add discovered tickers from distinct series_tickers (e.g. KXBTCD alongside KXBTC15M)
         for t in discovered:
-            if len(merged) >= 6:
-                break
-            pref = t.strip().upper().split("-", 1)[0]
-            if t not in merged and pref not in seen_prefixes:
-                seen_prefixes.add(pref)
-                merged.append(t)
+            _add_candidate(t, require_distinct_series=False)
+        for t in self.ws_client.tickers:
+            _add_candidate(t, require_distinct_series=False)
 
         # Pass 3: Only if < 6 distinct series_tickers exist, fill remaining slots
         for t in discovered:
@@ -421,6 +437,21 @@ class TradingEngine:
                 break
             if t not in merged:
                 merged.append(t)
+
+        # Always retain subscriptions for open positions until settlement or exit
+        for t in list(self.portfolio.positions.keys()):
+            if t not in merged:
+                merged.append(t)
+
+        displaced = [
+            t
+            for t in self.ws_client.tickers
+            if t not in merged and t not in self.portfolio.positions
+        ]
+        if displaced:
+            await self.ws_client.unsubscribe_tickers(displaced)
+            for t in displaced:
+                self._subscribed_at.pop(t, None)
 
         now_mono = time.monotonic()
         for t in merged:
@@ -519,7 +550,7 @@ class TradingEngine:
         )
 
     async def _ensure_shard_funded(
-        self, ticker: str, s: AppSettings, min_required: Decimal = Decimal("2.00")
+        self, ticker: str, s: AppSettings, min_required: Decimal | None = None
     ) -> None:
         if (
             self.rest_client is None
@@ -528,17 +559,54 @@ class TradingEngine:
         ):
             return
         shard = await self.rest_client.get_market_exchange_index(ticker)
+        eff_max_pos = self.risk_gate.effective_max_position_dollars(self.portfolio)
+        req = (
+            min_required
+            if min_required is not None
+            else (eff_max_pos + Decimal("0.50"))
+        )
+
+        other_shards = [
+            (idx, bal)
+            for idx, bal in self.rest_client.shard_balances.items()
+            if idx != shard and bal > Decimal("0")
+        ]
+        if other_shards:
+            target_bal = self.rest_client.shard_balances.get(shard, Decimal("0.00"))
+            if target_bal >= req:
+                self._funded_shards.add(shard)
+                return
+            other_shards.sort(key=lambda x: x[1], reverse=True)
+            donor_shard, donor_bal = other_shards[0]
+            shortfall = max(Decimal("0.01"), (req - target_bal).quantize(Decimal("0.01")))
+            desired = max(
+                shortfall,
+                (eff_max_pos + Decimal("0.50") - target_bal).quantize(Decimal("0.01")),
+            )
+            avail_donor = max(Decimal("0.00"), donor_bal - Decimal("0.50"))
+            transfer_amt = min(
+                desired, avail_donor if avail_donor >= shortfall else donor_bal
+            ).quantize(Decimal("0.01"))
+            if transfer_amt > Decimal("0"):
+                try:
+                    await self.rest_client.fund_shard(
+                        shard, transfer_amt, source_shard=donor_shard
+                    )
+                    self._funded_shards.add(shard)
+                except Exception as exc:
+                    logger.warning(
+                        "Auto-fund shard %d from shard %d failed: %s",
+                        shard,
+                        donor_shard,
+                        exc,
+                    )
+            return
+
         if shard == 0:
             return
         shard_bal = self.rest_client.shard_balances.get(shard, Decimal("0.00"))
-        shard0_bal = self.rest_client.shard_balances.get(0)
-        if shard_bal >= min_required and shard0_bal is not None and shard0_bal <= Decimal("1.00"):
-            self._funded_shards.add(shard)
-            return
-        if shard_bal < min_required or shard not in self._funded_shards:
+        if shard_bal < req or shard not in self._funded_shards:
             budget = self._deployable_budget(s)
-            if shard0_bal is not None and shard0_bal > Decimal("1.00"):
-                budget = min(budget, shard0_bal)
             if budget > Decimal("0"):
                 try:
                     await self.rest_client.fund_shard(shard, budget)
@@ -556,6 +624,7 @@ class TradingEngine:
             s.allowed_series_prefixes,
             max_tickers=6,
             environment=s.kalshi_environment.value,
+            prefer_15m_turnover=s.prefer_15m_turnover,
         )
         # Remove expired entries not held in open positions
         now_utc = datetime.now(timezone.utc)
@@ -608,6 +677,8 @@ class TradingEngine:
             dict.fromkeys(list(self.ws_client.tickers) + list(self.ws_client.orderbooks.keys()))
         )
         for ticker in all_tracked:
+            if ticker in self.portfolio.positions:
+                continue
             exp = self._market_expiries.get(ticker)
             close_in = (exp - now_utc).total_seconds() if exp is not None else None
             snap = self.ws_client.orderbooks.get(ticker)
@@ -656,47 +727,75 @@ class TradingEngine:
             try:
                 now_utc = datetime.now(timezone.utc)
                 now_mono = time.monotonic()
-                quarter_bucket = int(now_utc.timestamp()) // 900
+                ts_int = int(now_utc.timestamp())
+                quarter_bucket = ts_int // 900
+                sec_into_quarter = ts_int % 900
                 crossed_settlement_boundary = quarter_bucket != self._last_quarter_bucket
                 if crossed_settlement_boundary:
                     self._last_quarter_bucket = quarter_bucket
 
+                rollover_03_trigger = (
+                    sec_into_quarter >= 3 and quarter_bucket != self._last_rollover_03_bucket
+                )
+                if rollover_03_trigger:
+                    self._last_rollover_03_bucket = quarter_bucket
+                    logger.info(
+                        "[ROLLOVER] :03s past 15-minute boundary -> triggering immediate 15M discovery refresh"
+                    )
+
                 # Never count expired contracts toward Max Open Markets
+                expired_cleared = False
                 if s.execution_mode != ExecutionMode.SHADOW and self.portfolio.positions:
                     for t in list(self.portfolio.positions.keys()):
                         exp = self._market_expiries.get(t)
                         if exp is not None and exp <= now_utc:
                             self.portfolio.positions.pop(t, None)
+                            expired_cleared = True
 
                 # Poll resting orders every 10s (reaping orders > 20s old) and sync portfolio every 15s
+                # Always sync on settlement boundaries or when expired positions are cleared, even when PAUSED
                 if (
                     self.rest_client is not None
                     and self.rest_client.signer is not None
-                    and s.execution_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE)
+                    and s.execution_mode != ExecutionMode.SHADOW
                 ):
-                    if crossed_settlement_boundary or (
-                        (now_mono - self._last_portfolio_sync_monotonic) >= 15.0
+                    if (
+                        expired_cleared
+                        or crossed_settlement_boundary
+                        or rollover_03_trigger
+                        or (
+                            s.execution_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE)
+                            and (now_mono - self._last_portfolio_sync_monotonic) >= 15.0
+                        )
                     ):
                         await self.sync_balance_from_api()
-                    elif (now_mono - self._last_resting_reap_monotonic) >= 10.0:
+                    elif (
+                        s.execution_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE)
+                        and (now_mono - self._last_resting_reap_monotonic) >= 10.0
+                    ):
                         await self._reap_stale_resting_orders(now_utc=now_utc, now_mono=now_mono)
 
-                # Every 30s (or on 15m boundary), evict unhealthy tickers and refill missing slots up to 6
+                # Every 30s (or on 15m boundary / :03 rollover), evict unhealthy tickers and refill missing slots up to 6
                 evicted: list[str] = []
                 maintenance_due = (
                     crossed_settlement_boundary
+                    or rollover_03_trigger
                     or (now_mono - self._last_eviction_check_monotonic) >= 30.0
                 )
                 if maintenance_due:
                     self._last_eviction_check_monotonic = now_mono
                     evicted = await self._evict_unhealthy_subscriptions(s, now_utc, now_mono)
 
-                discovery_cooldown_ok = (now_mono - self._last_discovery_monotonic) >= 15.0
+                discovery_cooldown_ok = (
+                    rollover_03_trigger
+                    or (now_mono - self._last_discovery_monotonic) >= 15.0
+                )
                 if (
                     self.ws_client is not None
                     and discovery_cooldown_ok
                     and (
-                        evicted
+                        rollover_03_trigger
+                        or evicted
                         or (
                             maintenance_due
                             and (
@@ -729,12 +828,14 @@ class TradingEngine:
                         and not self.portfolio.kill_switch_tripped
                         and self.ws_client is not None
                     ):
+                        await self._evaluate_deterministic_exits(s, now_utc)
                         active_snapshots: list[OrderbookSnapshot] = []
                         stale_tickers: list[str] = []
                         for snap in list(self.ws_client.orderbooks.values()):
                             exp = self._market_expiries.get(snap.ticker)
                             if exp is not None and (exp - now_utc).total_seconds() < 120.0:
-                                stale_tickers.append(snap.ticker)
+                                if snap.ticker not in self.portfolio.positions:
+                                    stale_tickers.append(snap.ticker)
                                 continue
                             if snap.best_yes_bid is None or snap.best_yes_ask is None:
                                 continue
@@ -765,6 +866,104 @@ class TradingEngine:
                 logger.exception("Error in trading engine loop: %s", exc)
 
             await asyncio.sleep(s.poll_interval_ms / 1000.0)
+
+    async def _evaluate_deterministic_exits(
+        self, s: AppSettings, now_utc: datetime
+    ) -> list[TradeIntent]:
+        """Evaluate open positions every 1s for Take-Profit Lock or Hard Stop-Loss exits."""
+        if self.ws_client is None or not self.portfolio.positions:
+            return []
+
+        submitted: list[TradeIntent] = []
+        ts_ms = int(now_utc.timestamp() * 1000)
+        for ticker, pos in list(self.portfolio.positions.items()):
+            if pos.net_contracts == Decimal("0") or ticker in self.portfolio.resting_order_tickers:
+                continue
+            exp = self._market_expiries.get(ticker)
+            close_in = (exp - now_utc).total_seconds() if exp is not None else None
+            if close_in is not None and close_in <= 0.0:
+                continue
+
+            snap = self.ws_client.orderbooks.get(ticker)
+            if snap is None or snap.best_yes_bid is None or snap.best_yes_ask is None:
+                continue
+
+            if pos.net_contracts > Decimal("0"):
+                best_bid = snap.best_yes_bid
+                unrealized_gain = best_bid - pos.avg_entry_price
+                drop_below_entry = pos.avg_entry_price - best_bid
+                take_profit = (
+                    unrealized_gain >= Decimal("0.18") and best_bid >= Decimal("0.78")
+                ) or best_bid >= Decimal("0.85")
+                stop_loss = drop_below_entry >= Decimal("0.22") and (
+                    close_in is None or close_in > 180.0
+                )
+                exit_side = OrderSide.ASK
+                raw_exit_px = best_bid
+            else:
+                best_ask = snap.best_yes_ask
+                best_no_bid = Decimal("1.00") - best_ask
+                unrealized_gain = pos.avg_entry_price - best_ask
+                drop_below_entry = best_ask - pos.avg_entry_price
+                take_profit = (
+                    unrealized_gain >= Decimal("0.18") and best_no_bid >= Decimal("0.78")
+                ) or best_no_bid >= Decimal("0.85")
+                stop_loss = drop_below_entry >= Decimal("0.22") and (
+                    close_in is None or close_in > 180.0
+                )
+                exit_side = OrderSide.BID
+                raw_exit_px = best_ask
+
+            if not (take_profit or stop_loss):
+                continue
+
+            limit_px = min(Decimal("0.9900"), max(Decimal("0.0100"), raw_exit_px))
+            walk = walk_book(snap, exit_side, abs(pos.net_contracts), limit_price=limit_px)
+            exit_count = (
+                walk.fillable_count
+                if walk.fillable_count > Decimal("0")
+                else abs(pos.net_contracts)
+            )
+            edge_per_c = max(Decimal("0.0500"), abs(unrealized_gain)).quantize(Decimal("0.0001"))
+            total_edge = (edge_per_c * exit_count).quantize(Decimal("0.01"))
+            reason_tag = "TAKE_PROFIT_LOCK" if take_profit else "HARD_STOP_LOSS"
+            rationale = (
+                f"Deterministic {reason_tag}: entry=${pos.avg_entry_price:.4f} "
+                f"exit=${limit_px:.4f} unrealized={unrealized_gain:+.4f}/c"
+            )
+            intent = TradeIntent(
+                timestamp_ms=ts_ms,
+                ticker=ticker,
+                side=exit_side,
+                count=exit_count,
+                limit_price=limit_px,
+                expected_edge_dollars=total_edge,
+                expected_edge_per_contract=edge_per_c,
+                hold_to_expiry=False,
+                confidence=Decimal("0.99"),
+                inference_latency_ms=0,
+                rationale=rationale,
+                provider="deterministic_exit",
+            )
+            logger.info(
+                "[EXIT] %s ticker=%s side=%s count=%s price=$%s unrealized=%+.4f/c",
+                reason_tag,
+                ticker,
+                exit_side.value,
+                exit_count,
+                limit_px,
+                unrealized_gain,
+            )
+            d = intent.model_dump(mode="json")
+            d["action"] = "BUY" if intent.side == OrderSide.BID else "SELL"
+            d["prompt_tokens"] = 0
+            d["completion_tokens"] = 0
+            d["estimated_cost_usd"] = "0.000000"
+            await self.telemetry.log_ai_decision(d)
+            await self._evaluate_and_execute_intent(intent, snap, s, execute_orders=True)
+            submitted.append(intent)
+
+        return submitted
 
     async def eval_now(self) -> dict[str, Any]:
         """Force an immediate strategy + RiskGate evaluation across active tickers."""
@@ -929,35 +1128,91 @@ class TradingEngine:
                     + evaluation.estimated_entry_fee_dollars
                 )
                 await self._ensure_shard_funded(
-                    intent.ticker, s, min_required=max(required_cost, Decimal("2.00"))
+                    intent.ticker, s, min_required=required_cost + Decimal("0.50")
                 )
                 try:
                     resp = await self.rest_client.create_order(v2_order)
                 except KalshiApiError as first_exc:
                     shard = await self.rest_client.get_market_exchange_index(intent.ticker)
-                    if (
-                        "insufficient_shard_balance" in first_exc.message.lower()
-                        and shard != 0
-                    ):
-                        await self.rest_client.fund_shard(shard, self._deployable_budget(s))
-                        self._funded_shards.add(shard)
-                        resp = await self.rest_client.create_order(v2_order)
+                    msg_low = first_exc.message.lower()
+                    if "insufficient" in msg_low:
+                        other_shards = [
+                            (idx, bal)
+                            for idx, bal in self.rest_client.shard_balances.items()
+                            if idx != shard and bal > Decimal("0")
+                        ]
+                        if other_shards:
+                            other_shards.sort(key=lambda x: x[1], reverse=True)
+                            donor_idx, donor_bal = other_shards[0]
+                            target_bal = self.rest_client.shard_balances.get(
+                                shard, Decimal("0.00")
+                            )
+                            shortfall = max(
+                                Decimal("0.50"),
+                                (required_cost + Decimal("0.50") - target_bal).quantize(
+                                    Decimal("0.01")
+                                ),
+                            )
+                            amt = min(shortfall, donor_bal).quantize(Decimal("0.01"))
+                            await self.rest_client.fund_shard(
+                                shard, amt, source_shard=donor_idx
+                            )
+                            self._funded_shards.add(shard)
+                            resp = await self.rest_client.create_order(v2_order)
+                        elif shard != 0:
+                            await self.rest_client.fund_shard(
+                                shard, self._deployable_budget(s)
+                            )
+                            self._funded_shards.add(shard)
+                            resp = await self.rest_client.create_order(v2_order)
+                        else:
+                            raise
                     else:
                         raise
                 order_obj = resp.get("order", resp)
                 order_id = str(order_obj.get("order_id") or uuid.uuid4().hex[:12])
-                fill_count_raw = order_obj.get("fill_count") or order_obj.get("fill_count_fp")
-                rem_count_raw = order_obj.get("remaining_count") or order_obj.get("remaining_count_fp")
-                avg_fill_raw = order_obj.get("average_fill_price") or order_obj.get("average_fill_price_dollars")
-                avg_fee_raw = order_obj.get("average_fee_paid") or order_obj.get("average_fee_paid_dollars")
+                fill_count_raw = (
+                    order_obj.get("fill_count")
+                    if order_obj.get("fill_count") is not None
+                    else order_obj.get("fill_count_fp")
+                )
+                rem_count_raw = (
+                    order_obj.get("remaining_count")
+                    if order_obj.get("remaining_count") is not None
+                    else order_obj.get("remaining_count_fp")
+                )
+                avg_fill_raw = (
+                    order_obj.get("average_fill_price")
+                    if order_obj.get("average_fill_price") is not None
+                    else order_obj.get("average_fill_price_dollars")
+                )
+                avg_fee_raw = (
+                    order_obj.get("average_fee_paid")
+                    if order_obj.get("average_fee_paid") is not None
+                    else order_obj.get("average_fee_paid_dollars")
+                )
                 ts_ms = int(order_obj.get("ts_ms") or time.time() * 1000)
 
-                filled_qty = (
-                    Decimal(str(fill_count_raw))
-                    if fill_count_raw is not None
-                    else intent.count
+                raw_status = str(order_obj.get("status") or "").lower()
+                if fill_count_raw is not None:
+                    filled_qty = Decimal(str(fill_count_raw))
+                elif raw_status in ("resting", "pending", "open"):
+                    filled_qty = Decimal("0")
+                else:
+                    filled_qty = intent.count
+                rem_qty = (
+                    Decimal(str(rem_count_raw))
+                    if rem_count_raw is not None
+                    else (intent.count - filled_qty if filled_qty < intent.count else Decimal("0"))
                 )
-                rem_qty = Decimal(str(rem_count_raw)) if rem_count_raw is not None else Decimal("0")
+
+                # Update in-memory shard balance immediately so back-to-back orders see true available collateral
+                order_shard = await self.rest_client.get_market_exchange_index(intent.ticker)
+                if order_shard in self.rest_client.shard_balances:
+                    self.rest_client.shard_balances[order_shard] = max(
+                        Decimal("0.00"),
+                        self.rest_client.shard_balances[order_shard] - required_cost,
+                    )
 
                 if avg_fill_raw is not None:
                     actual_fill_price = Decimal(str(avg_fill_raw))
@@ -1120,6 +1375,7 @@ class TradingEngine:
             "current_equity_dollars": f"{self.portfolio.current_equity_dollars:.2f}",
             "equity_floor_dollars": f"{s.equity_floor:.2f}",
             "deployable_budget_dollars": f"{deployable:.2f}",
+            "effective_max_position_dollars": f"{self.risk_gate.effective_max_position_dollars(self.portfolio):.2f}",
             "session_net_pnl_dollars": f"{self.portfolio.session_net_pnl_dollars:.2f}",
             "estimated_llm_spend_usd": f"{self.telemetry.session_llm_spend_usd:.4f}",
             "session_start_ts": self.session_start_ts,

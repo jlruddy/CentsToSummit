@@ -551,6 +551,12 @@ async def test_ws_telemetry_hydrates_recent_history_on_connect(tmp_path: Path) -
         config_json_path=tmp_path / "config.json",
         key_dir=tmp_path / "keys",
     )
+    cfg_mgr.update_and_persist(
+        {
+            "execution_mode": "shadow",
+            "allowed_series_prefixes": ["KXETH15M", "KXETHD", "KXBTC15M"],
+        }
+    )
     telem = TelemetryManager(tmp_path / "telem.db")
     await telem.initialize()
     try:
@@ -909,6 +915,12 @@ async def test_evict_widened_off_band_and_expiring_tickers(tmp_path: Path) -> No
         config_json_path=tmp_path / "config.json",
         key_dir=tmp_path / "keys",
     )
+    cfg_mgr.update_and_persist(
+        {
+            "execution_mode": "shadow",
+            "allowed_series_prefixes": ["KXETH15M", "KXETHD", "KXBTC15M"],
+        }
+    )
     telem = TelemetryManager(tmp_path / "telem.db")
     engine = TradingEngine(cfg_mgr, telem)
     engine.ws_client = KalshiWebSocketClient(ws_url="wss://example.invalid")
@@ -1243,3 +1255,231 @@ async def test_portfolio_sync_drops_expired_positions_reaps_resting_orders_and_s
     finally:
         await client.close()
         await telem.close()
+
+
+async def test_bidirectional_shard_transfer_dynamic_sizing_and_per_contract_edge(
+    tmp_path: Path,
+) -> None:
+    from kalshi_poc.client import KalshiRestClient, KalshiWebSocketClient
+    from kalshi_poc.main import TradingEngine
+    from kalshi_poc.models import OrderSide, OrderbookSnapshot, PriceLevel, TradeIntent
+
+    cfg_mgr = ConfigManager(
+        env_path=tmp_path / ".env",
+        config_json_path=tmp_path / "config.json",
+        key_dir=tmp_path / "keys",
+    )
+    cfg_mgr.update_and_persist(
+        {
+            "kalshi_environment": "production",
+            "execution_mode": "live",
+            "initial_capital": "70.28",
+            "equity_floor": "5.00",
+            "max_position_dollars_per_market": "4.00",
+            "dynamic_sizing_enabled": True,
+            "house_money_risk_pct": "0.20",
+            "min_net_edge_dollars": "0.012",
+            "allowed_series_prefixes": ["KXINXU", "KXSOLD"],
+        }
+    )
+    telem = TelemetryManager(tmp_path / "telem.db")
+    await telem.initialize()
+    client = KalshiRestClient(
+        base_url="https://external-api.kalshi.com/trade-api/v2",
+        signer=AsyncMock(),
+    )
+    # Shard 0 has $1.00, Shard 2 has $66.22
+    client.shard_balances = {0: Decimal("1.0000"), 2: Decimal("66.2236")}
+    client.market_shards["KXINXU-26NOV17H1600-T7319.9999"] = 0
+    try:
+        engine = TradingEngine(cfg_mgr, telem)
+        engine.rest_client = client
+        engine.ws_client = KalshiWebSocketClient(ws_url="wss://example.invalid")
+
+        # 1. Dynamic house-money sizing: house_money = 70.28 - 5.00 = 65.28 -> 20% = $13.06
+        eff_cap = engine.risk_gate.effective_max_position_dollars(engine.portfolio)
+        assert eff_cap == Decimal("13.06")
+
+        # 2. 10-contract KXSOLD order ($5.00 notional <= $13.06 dynamic cap) with per-contract edge
+        sold_snap = OrderbookSnapshot(
+            ticker="KXSOLD-26NOV1716-T72.50",
+            timestamp_ms=1700000000000,
+            yes_bids=[PriceLevel(price=Decimal("0.49"), count=Decimal("50"))],
+            no_bids=[PriceLevel(price=Decimal("0.50"), count=Decimal("50"))],  # ask = 0.50
+        )
+        sold_intent = TradeIntent(
+            timestamp_ms=1700000000000,
+            ticker="KXSOLD-26NOV1716-T72.50",
+            side=OrderSide.BID,
+            count=Decimal("10"),
+            limit_price=Decimal("0.50"),
+            expected_edge_dollars=Decimal("0.06"),
+            expected_edge_per_contract=Decimal("0.06"),
+            hold_to_expiry=True,
+            confidence=Decimal("0.85"),
+            inference_latency_ms=5,
+            rationale="10c KXSOLD test",
+            provider="gemini",
+        )
+        sold_eval = engine.risk_gate.evaluate(sold_intent, sold_snap, engine.portfolio)
+        assert sold_eval.approved is True
+
+        # 3. KXINXU order on Shard 0 ($1.00 balance < $3.00 cost + $0.50) transfers from Shard 2 -> Shard 0
+        inx_snap = OrderbookSnapshot(
+            ticker="KXINXU-26NOV17H1600-T7319.9999",
+            timestamp_ms=1700000000000,
+            yes_bids=[PriceLevel(price=Decimal("0.49"), count=Decimal("50"))],
+            no_bids=[PriceLevel(price=Decimal("0.50"), count=Decimal("50"))],
+        )
+        inx_intent = TradeIntent(
+            timestamp_ms=1700000000000,
+            ticker="KXINXU-26NOV17H1600-T7319.9999",
+            side=OrderSide.BID,
+            count=Decimal("6"),
+            limit_price=Decimal("0.50"),
+            expected_edge_dollars=Decimal("0.36"),
+            expected_edge_per_contract=Decimal("0.06"),
+            hold_to_expiry=True,
+            confidence=Decimal("0.85"),
+            inference_latency_ms=5,
+            rationale="KXINXU shard 2->0 transfer test",
+            provider="gemini",
+        )
+        req_mock = AsyncMock(return_value=({}, 5.0))
+        with (
+            patch.object(client, "_request", req_mock),
+            patch.object(
+                client,
+                "create_order",
+                AsyncMock(return_value={"order_id": "inx-1", "fill_count": "6", "remaining_count": "0"}),
+            ),
+            patch.object(client, "upgrade_api_tier_once", AsyncMock(return_value=None)),
+        ):
+            await engine._evaluate_and_execute_intent(inx_intent, inx_snap, cfg_mgr.settings)
+
+        req_mock.assert_awaited_once()
+        assert req_mock.call_args.kwargs["json_body"]["source_exchange_shard"] == 2
+        assert req_mock.call_args.kwargs["json_body"]["destination_exchange_shard"] == 0
+    finally:
+        await client.close()
+        await telem.close()
+
+
+async def test_open_position_subscription_retention_deterministic_exits_and_2h_discovery(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import AsyncMock, patch
+    from kalshi_poc.client import KalshiRestClient, KalshiWebSocketClient
+    from kalshi_poc.main import TradingEngine
+    from kalshi_poc.models import MarketTicker, OrderSide, OrderbookSnapshot, Position, PriceLevel
+
+    cfg_mgr = ConfigManager(
+        env_path=tmp_path / ".env",
+        config_json_path=tmp_path / "config.json",
+        key_dir=tmp_path / "keys",
+    )
+    cfg_mgr.update_and_persist(
+        {
+            "execution_mode": "shadow",
+            "allowed_series_prefixes": ["KXETH15M", "KXETHD", "KXBTC15M"],
+        }
+    )
+    telem = TelemetryManager(tmp_path / "telem.db")
+    await telem.initialize()
+    engine = TradingEngine(cfg_mgr, telem)
+    now = datetime(2026, 11, 17, 22, 10, 0, tzinfo=timezone.utc)
+    engine.ws_client = KalshiWebSocketClient(
+        ws_url="wss://example.invalid",
+        signer=None,
+        on_orderbook=engine._on_orderbook,
+    )
+
+    try:
+        # 1. Open position ticker with mid > 0.85 and < 120s left must NOT be evicted
+        pos_ticker = "KXETH15M-26NOV171715-15"
+        engine.portfolio.positions[pos_ticker] = Position(
+            ticker=pos_ticker,
+            net_contracts=Decimal("4"),
+            avg_entry_price=Decimal("0.55"),
+            cost_basis_dollars=Decimal("2.20"),
+        )
+        tp_snap = OrderbookSnapshot(
+            ticker=pos_ticker,
+            timestamp_ms=int(now.timestamp() * 1000),
+            yes_bids=[PriceLevel(price=Decimal("0.86"), count=Decimal("20"))],
+            no_bids=[PriceLevel(price=Decimal("0.12"), count=Decimal("20"))],  # ask=0.88, mid=0.87
+        )
+        engine.ws_client.tickers = [pos_ticker]
+        engine.ws_client.set_snapshot(tp_snap)
+        engine._market_expiries[pos_ticker] = now + timedelta(seconds=60)
+        engine._subscribed_at[pos_ticker] = 10.0
+
+        evicted = await engine._evict_unhealthy_subscriptions(
+            cfg_mgr.settings, now, now_mono=100.0
+        )
+        assert evicted == []
+        assert pos_ticker in engine.ws_client.tickers
+
+        # 2. Deterministic Take-Profit Lock submits closing ASK order and closes position
+        submitted = await engine._evaluate_deterministic_exits(cfg_mgr.settings, now)
+        assert len(submitted) == 1
+        assert submitted[0].ticker == pos_ticker
+        assert submitted[0].side == OrderSide.ASK
+        assert submitted[0].count == Decimal("4")
+        assert pos_ticker not in engine.portfolio.positions
+
+        # 3. Deterministic Hard Stop-Loss (drop >= $0.22 with > 180s left) submits closing order
+        sl_ticker = "KXBTC15M-26NOV171730-30"
+        engine.portfolio.positions[sl_ticker] = Position(
+            ticker=sl_ticker,
+            net_contracts=Decimal("2"),
+            avg_entry_price=Decimal("0.55"),
+            cost_basis_dollars=Decimal("1.10"),
+        )
+        sl_snap = OrderbookSnapshot(
+            ticker=sl_ticker,
+            timestamp_ms=int(now.timestamp() * 1000),
+            yes_bids=[PriceLevel(price=Decimal("0.32"), count=Decimal("20"))],
+            no_bids=[PriceLevel(price=Decimal("0.66"), count=Decimal("20"))],
+        )
+        engine.ws_client.set_snapshot(sl_snap)
+        engine._market_expiries[sl_ticker] = now + timedelta(seconds=300)
+        sl_submitted = await engine._evaluate_deterministic_exits(cfg_mgr.settings, now)
+        assert len(sl_submitted) == 1
+        assert sl_submitted[0].ticker == sl_ticker
+        assert sl_submitted[0].side == OrderSide.ASK
+        assert sl_ticker not in engine.portfolio.positions
+
+        # 4. 2-hour discovery horizon (+7200s) rejects 24h tomorrow contract (KXETHD-26NOV1817)
+        client = KalshiRestClient("https://demo-api.kalshi.co/trade-api/v2", signer=None)
+        captured_max_close: list[int] = []
+
+        async def fake_get_markets(series_ticker=None, status="open", limit=200, **kwargs):
+            if "max_close_ts" in kwargs and kwargs["max_close_ts"] is not None:
+                captured_max_close.append(kwargs["max_close_ts"])
+            if series_ticker == "KXETHD":
+                return [
+                    MarketTicker(
+                        ticker="KXETHD-26NOV1817-T3100",
+                        series_ticker="KXETHD",
+                        yes_bid_dollars=Decimal("0.49"),
+                        yes_ask_dollars=Decimal("0.51"),
+                        close_time=now + timedelta(hours=24),
+                    )
+                ]
+            return []
+
+        with patch.object(client, "get_markets", side_effect=fake_get_markets):
+            discovered = await client.discover_active_markets(
+                prefixes=["KXETHD"],
+                max_tickers=5,
+                now_utc=now,
+                prefer_15m_turnover=False,
+            )
+        await client.close()
+        assert discovered == []
+        assert captured_max_close and captured_max_close[0] == int(now.timestamp()) + 7200
+    finally:
+        await telem.close()
+

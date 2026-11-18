@@ -240,7 +240,7 @@ def create_app(
     async def download_parquet() -> FileResponse:
         s = app.state.config_manager.settings
         export_dir = Path(s.db_path).parent / "exports"
-        zip_path = await asyncio.to_thread(export_parquet_zip, s.db_path, export_dir)
+        zip_path = await app.state.telemetry.export_parquet_zip_async(export_dir)
         return FileResponse(
             path=zip_path,
             media_type="application/zip",

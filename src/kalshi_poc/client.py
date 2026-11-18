@@ -196,8 +196,16 @@ class KalshiRestClient:
             return False, exp
         return True, exp
 
+    @staticmethod
+    def default_exchange_index_for_ticker(ticker: str) -> int:
+        """Default exchange_index: 2 for crypto (KXBTC*/KXETH*/KXSOL*/KXXRP*), 0 for index/macro."""
+        pref = ticker.strip().upper().split("-", 1)[0]
+        if pref.startswith(("KXBTC", "KXETH", "KXSOL", "KXXRP")):
+            return 2
+        return 0
+
     async def get_market_exchange_index(self, ticker: str) -> int:
-        """Return cached exchange_index for ticker, or fetch GET /markets/{ticker} if unknown."""
+        """Return cached exchange_index for ticker, or fetch GET /markets/{ticker} (with series default)."""
         if ticker in self.market_shards:
             return self.market_shards[ticker]
         try:
@@ -210,7 +218,7 @@ class KalshiRestClient:
                 return shard
         except Exception as exc:
             logger.debug("Failed to fetch exchange_index for %s: %s", ticker, exc)
-        return 0
+        return self.default_exchange_index_for_ticker(ticker)
 
     async def discover_active_markets(
         self,
@@ -219,6 +227,7 @@ class KalshiRestClient:
         environment: str = "demo",
         now_utc: datetime | None = None,
         max_per_series: int = 1,
+        prefer_15m_turnover: bool = True,
     ) -> list[MarketTicker]:
         """Direct per-series intraday discovery (limit=200, >= 125s life, 0.18<=mid<=0.82, hourly fallbacks)."""
         now = now_utc or datetime.now(timezone.utc)
@@ -229,16 +238,24 @@ class KalshiRestClient:
             and (now_et.hour, now_et.minute) < (16, 0)
         )
 
-        target_series = ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M"]
+        if prefer_15m_turnover:
+            target_series = ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M"]
+            crypto_hourly_fallback: dict[str, str] = {
+                "KXBTC15M": "KXBTCD",
+                "KXETH15M": "KXETHD",
+                "KXSOL15M": "KXSOLD",
+                "KXXRP15M": "KXXRPD",
+            }
+        else:
+            target_series = ["KXBTCD", "KXETHD", "KXSOLD", "KXXRPD"]
+            crypto_hourly_fallback = {
+                "KXBTCD": "KXBTC15M",
+                "KXETHD": "KXETH15M",
+                "KXSOLD": "KXSOL15M",
+                "KXXRPD": "KXXRP15M",
+            }
         if in_us_market_hours:
             target_series.extend(["KXINXU", "KXNASDAQ100U"])
-
-        crypto_hourly_fallback: dict[str, str] = {
-            "KXBTC15M": "KXBTCD",
-            "KXETH15M": "KXETHD",
-            "KXSOL15M": "KXSOLD",
-            "KXXRP15M": "KXXRPD",
-        }
 
         pref_tuple = tuple(p.upper() for p in prefixes)
         if pref_tuple:
@@ -324,7 +341,7 @@ class KalshiRestClient:
                 return Decimal("1.00")
             return max(Decimal("0"), ask - bid)
 
-        max_close_ts = int(now.timestamp()) + 86400
+        max_close_ts = int(now.timestamp()) + 7200
 
         async def _fetch_series(series: str) -> list[MarketTicker]:
             for attempt in range(2):
@@ -362,7 +379,12 @@ class KalshiRestClient:
                 )
                 or (not m.series_ticker and m.ticker.upper().startswith(s_up))
             ]
-            eligible = [m for m in series_mkts if _remaining_secs(m) >= 125.0]
+            eligible = [
+                m
+                for m in series_mkts
+                if _remaining_secs(m) >= 125.0
+                and (_expiry_dt_utc(m) is None or _remaining_secs(m) <= 7200.0)
+            ]
             if not eligible:
                 logger.info(
                     "[DISCOVERY] series=%s open_count=%d selected=NONE reason=no_contract_ge_125s",
@@ -499,9 +521,27 @@ class KalshiRestClient:
         )
         return data
 
-    async def fund_shard(self, target_shard: int, amount_dollars: Decimal) -> dict[str, Any]:
-        """Transfer collateral from Shard 0 to `target_shard` (amount in centicents)."""
-        if target_shard == 0 or amount_dollars <= Decimal("0"):
+    async def fund_shard(
+        self,
+        target_shard: int,
+        amount_dollars: Decimal,
+        source_shard: int | None = None,
+    ) -> dict[str, Any]:
+        """Bidirectionally transfer collateral from `source_shard` (or richest other shard) to `target_shard`."""
+        if amount_dollars <= Decimal("0"):
+            return {}
+        if source_shard is None:
+            candidates = [
+                (s_idx, bal)
+                for s_idx, bal in self.shard_balances.items()
+                if s_idx != target_shard and bal > Decimal("0")
+            ]
+            if candidates:
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                source_shard = candidates[0][0]
+            else:
+                source_shard = 0 if target_shard != 0 else 2
+        if source_shard == target_shard:
             return {}
         centicents = int(amount_dollars * Decimal("10000"))
         if centicents <= 0:
@@ -509,7 +549,7 @@ class KalshiRestClient:
         payload = {
             "source": "event_contract",
             "destination": "event_contract",
-            "source_exchange_shard": 0,
+            "source_exchange_shard": source_shard,
             "destination_exchange_shard": target_shard,
             "source_subaccount": 0,
             "destination_subaccount": 0,
@@ -522,16 +562,27 @@ class KalshiRestClient:
                 json_body=payload,
                 private=True,
             )
+            if source_shard in self.shard_balances:
+                self.shard_balances[source_shard] = max(
+                    Decimal("0.00"), self.shard_balances[source_shard] - amount_dollars
+                )
             self.shard_balances[target_shard] = (
                 self.shard_balances.get(target_shard, Decimal("0.00")) + amount_dollars
             )
             logger.info(
-                "Transferred $%.2f from shard 0 -> shard %d", amount_dollars, target_shard
+                "Transferred $%.2f from shard %d -> shard %d",
+                amount_dollars,
+                source_shard,
+                target_shard,
             )
             return data
         except KalshiApiError as exc:
             logger.error(
-                "Shard transfer failed: HTTP %s %s", exc.status_code, exc.message
+                "Shard transfer (%d -> %d) failed: HTTP %s %s",
+                source_shard,
+                target_shard,
+                exc.status_code,
+                exc.message,
             )
             raise
 

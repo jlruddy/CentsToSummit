@@ -233,3 +233,66 @@ def test_risk_gate_rejects_outside_015_085_price_band_and_chasing_ask() -> None:
     res_moved = gate.evaluate(stale_intent, moved_snap, _make_portfolio())
     assert res_moved.approved is False
     assert any("moved > max slippage" in r for r in res_moved.rejection_reasons)
+
+
+def test_risk_gate_allows_reducing_exit_above_085_and_blocks_correlated_expiry_hour() -> None:
+    settings = AppSettings(
+        _env_file=None,
+        allowed_series_prefixes=["KXETHD", "KXETH15M", "KXBTC"],
+        max_open_markets=1,
+        min_net_edge_dollars=Decimal("0.04"),
+    )
+    gate = RiskGate(settings)
+    portfolio = _make_portfolio()
+    portfolio.positions["KXETHD-26NOV1719-T3119.99"] = Position(
+        ticker="KXETHD-26NOV1719-T3119.99",
+        net_contracts=Decimal("4"),
+        avg_entry_price=Decimal("0.55"),
+        cost_basis_dollars=Decimal("2.20"),
+    )
+
+    # 1. Reducing exit (ASK when net_contracts > 0) at $0.88 (> $0.85) with max_open_markets=1 is approved
+    tp_snap = OrderbookSnapshot(
+        ticker="KXETHD-26NOV1719-T3119.99",
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal("0.88"), count=Decimal("20"))],
+        no_bids=[PriceLevel(price=Decimal("0.10"), count=Decimal("20"))],
+    )
+    exit_intent = _make_intent(
+        ticker="KXETHD-26NOV1719-T3119.99",
+        side=OrderSide.ASK,
+        count=Decimal("4"),
+        limit_price=Decimal("0.88"),
+        expected_edge_dollars=Decimal("0.01"),
+        expected_edge_per_contract=Decimal("0.0025"),
+        hold_to_expiry=False,
+    )
+    res_exit = gate.evaluate(exit_intent, tp_snap, portfolio)
+    assert res_exit.approved is True, res_exit.rejection_reasons
+
+    # 2. Second strike on same underlying + expiry_hour (KXETHD-26NOV1719-*) is blocked
+    gate_multi = RiskGate(
+        AppSettings(
+            _env_file=None,
+            allowed_series_prefixes=["KXETHD", "KXETH15M", "KXBTC"],
+            max_open_markets=5,
+        )
+    )
+    corr_snap = OrderbookSnapshot(
+        ticker="KXETHD-26NOV1719-T3139.99",
+        timestamp_ms=1700000000000,
+        yes_bids=[PriceLevel(price=Decimal("0.49"), count=Decimal("20"))],
+        no_bids=[PriceLevel(price=Decimal("0.49"), count=Decimal("20"))],
+    )
+    corr_intent = _make_intent(
+        ticker="KXETHD-26NOV1719-T3139.99",
+        side=OrderSide.BID,
+        count=Decimal("2"),
+        limit_price=Decimal("0.51"),
+        expected_edge_dollars=Decimal("0.16"),
+        expected_edge_per_contract=Decimal("0.08"),
+    )
+    res_corr = gate_multi.evaluate(corr_intent, corr_snap, portfolio)
+    assert res_corr.approved is False
+    assert any("Correlated underlying + expiry_hour" in r for r in res_corr.rejection_reasons)
+

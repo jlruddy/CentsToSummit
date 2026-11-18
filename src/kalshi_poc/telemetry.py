@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS equity_curve (
     open_risk_collateral_dollars TEXT NOT NULL,
     equity_floor_dollars TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_ai_decisions_ts ON ai_decisions(timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_risk_evaluations_ts ON risk_evaluations(timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_and_fills_ts ON orders_and_fills(timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_equity_curve_ts ON equity_curve(timestamp_ms DESC);
 """
 
 
@@ -120,6 +125,7 @@ class TelemetryManager:
         self._db: aiosqlite.Connection | None = None
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._write_lock = asyncio.Lock()
+        self._last_ob_db_write_ms: dict[str, int] = {}
         self.session_id: str = uuid.uuid4().hex[:12]
         self.session_start_ts: int = int(time.time() * 1000)
         self.session_llm_spend_usd: Decimal = Decimal("0.000000")
@@ -270,6 +276,8 @@ class TelemetryManager:
     async def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.db_path)
+        await self._db.execute("PRAGMA busy_timeout=5000;")
+        await self._db.execute("PRAGMA mmap_size=0;")
         await self._db.execute("PRAGMA journal_mode=WAL;")
         await self._db.execute("PRAGMA synchronous=NORMAL;")
         await self._db.executescript(SCHEMA_SQL)
@@ -318,7 +326,9 @@ class TelemetryManager:
     async def log_orderbook(self, snap: OrderbookSnapshot) -> None:
         yes_bids = [[str(l.price), str(l.count)] for l in snap.yes_bids[-5:]]
         no_bids = [[str(l.price), str(l.count)] for l in snap.no_bids[-5:]]
-        if self._db is not None:
+        last_write = self._last_ob_db_write_ms.get(snap.ticker, 0)
+        if self._db is not None and (snap.timestamp_ms - last_write) >= 10000:
+            self._last_ob_db_write_ms[snap.ticker] = snap.timestamp_ms
             async with self._write_lock:
                 await self._db.execute(
                     """
@@ -338,6 +348,9 @@ class TelemetryManager:
                         json.dumps(yes_bids),
                         json.dumps(no_bids),
                     ),
+                )
+                await self._db.execute(
+                    "DELETE FROM orderbook_snapshots WHERE id <= (SELECT MAX(id) - 5000 FROM orderbook_snapshots)"
                 )
                 await self._db.commit()
 
@@ -495,50 +508,45 @@ class TelemetryManager:
         await self.broadcast("EQUITY", payload)
 
 
+    async def export_parquet_zip_async(self, output_dir: str | Path) -> Path:
+        """Flush SQLite connection and export to Parquet without holding the live write lock."""
+        async with self._write_lock:
+            if self._db is not None:
+                await self._db.commit()
+        return await asyncio.to_thread(export_parquet_zip, self.db_path, output_dir)
+
+
 def export_sqlite_to_parquet(db_path: str | Path, output_dir: str | Path) -> list[Path]:
-    """Export all 5 SQLite WAL telemetry tables to Parquet files using DuckDB + PyArrow."""
+    """Export all 5 SQLite telemetry tables to Parquet files using sqlite3 + PyArrow (zero mmap)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     db_file = Path(db_path)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if not db_file.exists():
-        # Ensure empty tables exist before exporting
-        conn = sqlite3.connect(db_file)
+        conn = sqlite3.connect(db_file, timeout=10.0)
+        conn.execute("PRAGMA mmap_size=0;")
         conn.executescript(SCHEMA_SQL)
         conn.close()
 
     exported: list[Path] = []
-    con = duckdb.connect(database=":memory:")
+    sconn = sqlite3.connect(db_file, timeout=10.0)
+    sconn.execute("PRAGMA busy_timeout=5000;")
+    sconn.execute("PRAGMA mmap_size=0;")
+    sconn.row_factory = sqlite3.Row
     try:
-        con.execute("INSTALL sqlite; LOAD sqlite;")
-    except Exception:
-        pass
-
-    # Fallback-safe: read via sqlite3 + pyarrow if duckdb sqlite extension is unavailable offline
-    try:
-        con.execute(f"ATTACH '{db_file.as_posix()}' AS src (TYPE sqlite);")
         for table in TABLES:
+            cur = sconn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT 50000")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description] if cur.description else []
+            data = {col: [r[col] for r in reversed(rows)] for col in cols}
+            arrow_tbl = pa.table(data)
             out_file = out_dir / f"{table}.parquet"
-            con.execute(f"COPY src.{table} TO '{out_file.as_posix()}' (FORMAT PARQUET);")
+            pq.write_table(arrow_tbl, out_file)
             exported.append(out_file)
-    except Exception:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        sconn = sqlite3.connect(db_file)
-        sconn.row_factory = sqlite3.Row
-        try:
-            for table in TABLES:
-                rows = sconn.execute(f"SELECT * FROM {table}").fetchall()
-                cols = [d[0] for d in sconn.execute(f"SELECT * FROM {table} LIMIT 0").description]
-                data = {col: [r[col] for r in rows] for col in cols}
-                arrow_tbl = pa.table(data)
-                out_file = out_dir / f"{table}.parquet"
-                pq.write_table(arrow_tbl, out_file)
-                exported.append(out_file)
-        finally:
-            sconn.close()
     finally:
-        con.close()
+        sconn.close()
 
     return exported
 

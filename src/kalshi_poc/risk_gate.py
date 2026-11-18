@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from decimal import Decimal
 
@@ -15,12 +16,40 @@ from kalshi_poc.models import (
 )
 from kalshi_poc.simulator import calculate_taker_fee, walk_book
 
+logger = logging.getLogger(__name__)
 ONE = Decimal("1.00")
 
 
 def extract_series_prefix(ticker: str) -> str:
     """Extract the series prefix from a Kalshi ticker (e.g. KXBTC-26NOV-T90000 -> KXBTC)."""
     return ticker.strip().upper().split("-", 1)[0]
+
+
+def extract_underlying_expiry_hour(ticker: str) -> str | None:
+    """Extract normalized (underlying:YYMMMDDHH) key for hourly/intraday correlation gating."""
+    parts = ticker.strip().upper().split("-")
+    if len(parts) < 2:
+        return None
+    raw = parts[0]
+    if raw.startswith("KXINX"):
+        underlying = "INX"
+    elif raw.startswith("KXNASDAQ"):
+        underlying = "NASDAQ"
+    elif raw.startswith("KXBTC"):
+        underlying = "BTC"
+    elif raw.startswith("KXETH"):
+        underlying = "ETH"
+    elif raw.startswith("KXSOL"):
+        underlying = "SOL"
+    elif raw.startswith("KXXRP"):
+        underlying = "XRP"
+    else:
+        underlying = raw
+
+    dt_token = parts[1]
+    if len(dt_token) >= 9 and dt_token[:2].isdigit() and dt_token[5:9].isdigit():
+        return f"{underlying}:{dt_token[:9]}"
+    return None
 
 
 class RiskGate:
@@ -34,6 +63,28 @@ class RiskGate:
 
     def update_settings(self, settings: AppSettings) -> None:
         self._settings = settings
+
+    def effective_max_position_dollars(self, portfolio: PortfolioState) -> Decimal:
+        """Return active per-market dollar cap (dynamic % of house money when enabled)."""
+        s = self._settings
+        if not s.dynamic_sizing_enabled:
+            return s.max_position_dollars_per_market
+        house_money = max(
+            Decimal("0.00"), portfolio.current_equity_dollars - s.equity_floor
+        )
+        deployable_budget = max(
+            Decimal("0.00"),
+            portfolio.current_equity_dollars
+            - s.equity_floor
+            - portfolio.open_risk_collateral_dollars,
+        )
+        dynamic_cap = max(
+            Decimal("1.00"),
+            (house_money * s.house_money_risk_pct).quantize(Decimal("0.01")),
+        )
+        if deployable_budget >= Decimal("1.00"):
+            return min(deployable_budget, dynamic_cap)
+        return dynamic_cap
 
     def reset(self, portfolio: PortfolioState | None = None) -> None:
         """Clear kill-switch and intra-minute / daily risk counters."""
@@ -93,21 +144,35 @@ class RiskGate:
         active_tickers = {
             k for k, pos in portfolio.positions.items() if pos.net_contracts != Decimal("0")
         } | set(portfolio.resting_order_tickers)
-        if intent.ticker not in active_tickers and len(active_tickers) >= s.max_open_markets:
-            reasons.append(
-                f"Max open markets reached ({len(active_tickers)}/{s.max_open_markets})"
-            )
 
         existing_pos = portfolio.positions.get(intent.ticker)
         is_reducing_exit = (
             existing_pos is not None
             and existing_pos.net_contracts != Decimal("0")
-            and not intent.hold_to_expiry
+            and intent.count <= abs(existing_pos.net_contracts)
             and (
                 (existing_pos.net_contracts > Decimal("0") and intent.side == OrderSide.ASK)
                 or (existing_pos.net_contracts < Decimal("0") and intent.side == OrderSide.BID)
             )
         )
+        if not is_reducing_exit and intent.ticker not in active_tickers and len(active_tickers) >= s.max_open_markets:
+            reasons.append(
+                f"Max open markets reached ({len(active_tickers)}/{s.max_open_markets})"
+            )
+
+        if not is_reducing_exit:
+            target_hour_key = extract_underlying_expiry_hour(intent.ticker)
+            if target_hour_key is not None:
+                for active_t in sorted(active_tickers):
+                    if (
+                        active_t != intent.ticker
+                        and extract_underlying_expiry_hour(active_t) == target_hour_key
+                    ):
+                        reasons.append(
+                            f"Correlated underlying + expiry_hour position already active on {active_t} ({target_hour_key}); stacking correlated strikes blocked"
+                        )
+                        break
+
         if intent.ticker in portfolio.resting_order_tickers:
             reasons.append(
                 f"Active resting order already exists on {intent.ticker} (1 order per ticker limit)"
@@ -128,9 +193,10 @@ class RiskGate:
             intent.limit_price if intent.side == OrderSide.BID else (ONE - intent.limit_price)
         )
         proposed_notional = (intent.count * unit_collateral).quantize(Decimal("0.01"))
-        if existing_notional + proposed_notional > s.max_position_dollars_per_market:
+        effective_max_pos = self.effective_max_position_dollars(portfolio)
+        if not is_reducing_exit and existing_notional + proposed_notional > effective_max_pos:
             reasons.append(
-                f"Market position limit exceeded (${existing_notional + proposed_notional:.2f} > ${s.max_position_dollars_per_market:.2f})"
+                f"Market position limit exceeded (${existing_notional + proposed_notional:.2f} > ${effective_max_pos:.2f})"
             )
 
         # 4. Orderbook depth, price-band [0.15, 0.85], slippage, and fee-edge filter
@@ -178,56 +244,73 @@ class RiskGate:
                         f"Estimated slippage {walk.slippage_cents_per_contract}c exceeds max {s.max_slippage_cents}c"
                     )
 
-                is_intraday_binary = (
-                    series_prefix.endswith("15M")
-                    or series_prefix.endswith("D")
-                    or series_prefix.endswith("U")
-                )
-                hold_to_expiry_eligible = intent.hold_to_expiry or is_intraday_binary
-                primary_fee = entry_fee if hold_to_expiry_eligible else round_trip_fee
-                total_expected_edge = (
-                    intent.expected_edge_per_contract * intent.count
-                    if intent.expected_edge_per_contract is not None
-                    else intent.expected_edge_dollars
-                )
+                if not is_reducing_exit:
+                    is_intraday_binary = (
+                        series_prefix.endswith("15M")
+                        or series_prefix.endswith("D")
+                        or series_prefix.endswith("U")
+                    )
+                    hold_to_expiry_eligible = intent.hold_to_expiry or is_intraday_binary
+                    primary_fee = entry_fee if hold_to_expiry_eligible else round_trip_fee
 
-                total_order_cost = (
-                    est_fill_price if intent.side == OrderSide.BID else (ONE - est_fill_price)
-                ) * intent.count
-                if total_order_cost > Decimal("0") and (
-                    primary_fee / total_order_cost
-                ) > Decimal("0.15"):
-                    fee_pct = (primary_fee / total_order_cost * Decimal("100")).quantize(
-                        Decimal("0.1")
-                    )
-                    reasons.append(
-                        f"Fee-to-notional ratio {fee_pct}% exceeds 15.0% max (${primary_fee:.2f} / ${total_order_cost:.2f})"
-                    )
+                    total_order_cost = (
+                        est_fill_price if intent.side == OrderSide.BID else (ONE - est_fill_price)
+                    ) * intent.count
+                    if total_order_cost > Decimal("0") and (
+                        primary_fee / total_order_cost
+                    ) > Decimal("0.15"):
+                        fee_pct = (primary_fee / total_order_cost * Decimal("100")).quantize(
+                            Decimal("0.1")
+                        )
+                        reasons.append(
+                            f"Fee-to-notional ratio {fee_pct}% exceeds 15.0% max (${primary_fee:.2f} / ${total_order_cost:.2f})"
+                        )
 
-                total_friction = est_slippage + primary_fee
-                net_edge = total_expected_edge - total_friction
-                min_required_net = (
-                    Decimal("0.01") * intent.count
-                    if hold_to_expiry_eligible
-                    else s.min_net_edge_dollars
-                )
-                if total_friction >= total_expected_edge:
-                    reasons.append(
-                        f"Fee + slippage (${total_friction:.4f}) >= expected edge (${total_expected_edge:.4f})"
-                    )
-                elif net_edge < min_required_net:
-                    reasons.append(
-                        f"Net edge (${net_edge:.4f}) below minimum (${min_required_net:.2f})"
-                    )
+                    # Normalize both sides of net edge comparison strictly to per-contract dollars
+                    if intent.expected_edge_per_contract is not None:
+                        gross_edge_per_c = intent.expected_edge_per_contract
+                        min_net_edge_per_c = (
+                            min(s.min_net_edge_dollars, Decimal("0.015"))
+                            if hold_to_expiry_eligible
+                            else s.min_net_edge_dollars
+                        )
+                    elif intent.count > Decimal("1") and intent.expected_edge_dollars <= Decimal("0.20"):
+                        gross_edge_per_c = intent.expected_edge_dollars
+                        min_net_edge_per_c = (
+                            min(s.min_net_edge_dollars, Decimal("0.015"))
+                            if hold_to_expiry_eligible
+                            else s.min_net_edge_dollars
+                        )
+                    else:
+                        gross_edge_per_c = (intent.expected_edge_dollars / intent.count).quantize(
+                            Decimal("0.0001")
+                        )
+                        min_net_edge_per_c = (s.min_net_edge_dollars / intent.count).quantize(
+                            Decimal("0.0001")
+                        )
 
-        # Enforce 0.15 <= effective_price <= 0.85 on both YES and NO sides
+                    fee_per_c = (primary_fee / intent.count).quantize(Decimal("0.0001"))
+                    slip_per_c = (est_slippage / intent.count).quantize(Decimal("0.0001"))
+                    friction_per_c = fee_per_c + slip_per_c
+                    net_edge_per_c = gross_edge_per_c - friction_per_c
+
+                    if friction_per_c >= gross_edge_per_c:
+                        reasons.append(
+                            f"Fee + slippage (${friction_per_c:.4f}/c) >= expected edge (${gross_edge_per_c:.4f}/c)"
+                        )
+                    elif net_edge_per_c < min_net_edge_per_c:
+                        reasons.append(
+                            f"Net edge (${net_edge_per_c:.4f}) below minimum (${min_net_edge_per_c:.4f})"
+                        )
+
+        # Enforce 0.15 <= effective_price <= 0.85 on both YES and NO sides for new entries
         effective_fill_price = (
             est_fill_price if intent.side == OrderSide.BID else (ONE - est_fill_price)
         )
         effective_limit_price = (
             intent.limit_price if intent.side == OrderSide.BID else (ONE - intent.limit_price)
         )
-        if not (
+        if not is_reducing_exit and not (
             Decimal("0.15") <= est_fill_price <= Decimal("0.85")
             and Decimal("0.15") <= (ONE - est_fill_price) <= Decimal("0.85")
             and Decimal("0.15") <= intent.limit_price <= Decimal("0.85")
@@ -238,23 +321,34 @@ class RiskGate:
             )
 
         # 5. Hard Equity Floor (EQUITY_FLOOR)
-        proposed_collateral = proposed_notional + entry_fee
+        proposed_collateral = Decimal("0.00") if is_reducing_exit else (proposed_notional + entry_fee)
         worst_case_equity_after = (
             portfolio.current_equity_dollars
             - portfolio.open_risk_collateral_dollars
             - proposed_collateral
         ).quantize(Decimal("0.01"))
 
-        if worst_case_equity_after < s.equity_floor:
+        if not is_reducing_exit and worst_case_equity_after < s.equity_floor:
             reasons.append(
                 f"Equity floor breach (worst-case ${worst_case_equity_after:.2f} < floor ${s.equity_floor:.2f})"
             )
+
+        approved = len(reasons) == 0
+        logger.info(
+            "[RISK_GATE] ticker=%s approved=%s notional=$%.2f effective_max_pos=$%.2f (dynamic=%s, risk_pct=%.0f%%)",
+            intent.ticker,
+            approved,
+            proposed_notional,
+            effective_max_pos,
+            s.dynamic_sizing_enabled,
+            float(s.house_money_risk_pct) * 100.0,
+        )
 
         return RiskEvaluation(
             intent_id=intent.intent_id,
             timestamp_ms=ts,
             ticker=intent.ticker,
-            approved=len(reasons) == 0,
+            approved=approved,
             rejection_reasons=reasons,
             estimated_fill_price=est_fill_price,
             estimated_slippage_dollars=est_slippage,

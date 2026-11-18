@@ -24,15 +24,24 @@ from kalshi_poc.models import (
     StrategyProvider,
     TradeIntent,
 )
+from kalshi_poc.risk_gate import extract_underlying_expiry_hour
 from kalshi_poc.simulator import calculate_taker_fee
 
 logger = logging.getLogger(__name__)
+
+MID_TREND_GUIDANCE = (
+    "Weigh mid_delta_5m heavily: do not buy YES (BID) into temporary Level-1 bid walls "
+    "when mid_delta_5m <= -0.05 (prefer ASK / Long NO momentum or HOLD during multi-minute "
+    "downtrends)."
+)
 
 DEFAULT_BATCH_SYSTEM_PROMPT = (
     "You are an independent prediction-market microstructure research agent analyzing "
     "a batch of live Kalshi orderbooks. Only propose a trade when the expected settlement "
     "or short-term move exceeds $0.04 (4 cents) per contract AFTER crossing the current "
-    "spread; otherwise return [] (HOLD). Return ONLY a valid JSON array of trade objects: "
+    "spread; otherwise return [] (HOLD). "
+    f"{MID_TREND_GUIDANCE} "
+    "Return ONLY a valid JSON array of trade objects: "
     '{"ticker": "TICKER", "side": "bid"|"ask", "count": "2", '
     '"limit_price": "0.5200", "expected_edge_per_contract": "0.05", '
     '"hold_to_expiry": true, "confidence": "0.75", "rationale": "short reason"}. '
@@ -88,6 +97,25 @@ class BaseStrategy(ABC):
 
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
+
+    def _effective_max_pos(self, portfolio: PortfolioState) -> Decimal:
+        s = self.settings
+        if not s.dynamic_sizing_enabled:
+            return s.max_position_dollars_per_market
+        house_money = max(
+            Decimal("0.00"), portfolio.current_equity_dollars - s.equity_floor
+        )
+        deployable = max(
+            Decimal("0.00"),
+            portfolio.current_equity_dollars
+            - s.equity_floor
+            - portfolio.open_risk_collateral_dollars,
+        )
+        dyn = max(
+            Decimal("1.00"),
+            (house_money * s.house_money_risk_pct).quantize(Decimal("0.01")),
+        )
+        return min(deployable, dyn) if deployable >= Decimal("1.00") else dyn
 
     @abstractmethod
     async def evaluate(
@@ -237,7 +265,7 @@ class StubMomentumStrategy(BaseStrategy):
         limit_price: Decimal,
         avail_liquidity: Decimal,
         remaining_budget: Decimal,
-        cap_contracts: int = 10,
+        cap_contracts: int = 200,
     ) -> int:
         """Size contract count (down to 1) from top-of-book liquidity & remaining budget."""
         if avail_liquidity < Decimal("1") or remaining_budget <= Decimal("0"):
@@ -408,9 +436,10 @@ class StubMomentumStrategy(BaseStrategy):
             - portfolio.open_risk_collateral_dollars,
         )
         current_pos_cost = pos.cost_basis_dollars if pos is not None else Decimal("0.00")
+        effective_max_pos = self._effective_max_pos(portfolio)
         remaining_budget = min(
             deployable_budget,
-            self.settings.max_position_dollars_per_market - current_pos_cost,
+            effective_max_pos - current_pos_cost,
         )
 
         if total_vol > Decimal("0") and imbalance >= Decimal("0.20") and momentum >= Decimal("0"):
@@ -519,6 +548,58 @@ class _LLMStrategyBase(BaseStrategy):
         self._inflight_lock = asyncio.Lock()
         self._last_llm_call_monotonic: float = 0.0
         self._last_llm_mids: dict[str, Decimal] = {}
+        self._mid_history: dict[str, deque[tuple[float, Decimal]]] = {}
+        self._mid_last_meta: dict[str, tuple[float, int]] = {}
+
+    def _record_mid_prices(self, snapshots: list[OrderbookSnapshot]) -> None:
+        """Maintain a lightweight rolling ring buffer of mid-prices per ticker (15s, 60s, 300s)."""
+        now_mono = time.monotonic()
+        for snap in snapshots:
+            mid = snap.mid_yes_price
+            if mid is None:
+                continue
+            buf = self._mid_history.get(snap.ticker)
+            if buf is None:
+                buf = deque(maxlen=360)
+                self._mid_history[snap.ticker] = buf
+            meta = self._mid_last_meta.get(snap.ticker)
+            if not buf or meta is None:
+                eff_ts = (snap.timestamp_ms / 1000.0) if snap.timestamp_ms > 0 else now_mono
+                buf.append((eff_ts, mid))
+                self._mid_last_meta[snap.ticker] = (now_mono, snap.timestamp_ms)
+            else:
+                last_mono, last_snap_ms = meta
+                snap_dt = (
+                    (snap.timestamp_ms - last_snap_ms) / 1000.0
+                    if snap.timestamp_ms > 0 and last_snap_ms > 0
+                    else 0.0
+                )
+                mono_dt = max(0.0, now_mono - last_mono)
+                dt = max(snap_dt, mono_dt)
+                eff_ts = buf[-1][0] + dt
+                if dt >= 0.5 or buf[-1][1] != mid:
+                    buf.append((eff_ts, mid))
+                    self._mid_last_meta[snap.ticker] = (now_mono, snap.timestamp_ms)
+            cutoff = buf[-1][0] - 360.0
+            while len(buf) > 1 and buf[0][0] < cutoff:
+                buf.popleft()
+
+    def _mid_delta_over_window(
+        self, ticker: str, current_mid: Decimal | None, window_sec: float
+    ) -> Decimal:
+        """Return rolling mid-price change over `window_sec` (e.g. 15s, 60s, 300s)."""
+        if current_mid is None:
+            return Decimal("0")
+        buf = self._mid_history.get(ticker)
+        if not buf:
+            return Decimal("0")
+        target_ts = buf[-1][0] - window_sec
+        ref_mid = buf[0][1]
+        for ts_val, m_val in reversed(buf):
+            if ts_val <= target_ts:
+                ref_mid = m_val
+                break
+        return current_mid - ref_mid
 
     @staticmethod
     def _compute_imbalance(snapshot: OrderbookSnapshot) -> Decimal:
@@ -556,8 +637,33 @@ class _LLMStrategyBase(BaseStrategy):
         if elapsed >= self.settings.llm_heartbeat_sec:
             return True, "heartbeat"
 
-        if any(p.net_contracts != Decimal("0") for p in pos_map.values()):
-            return True, "open_position"
+        active_positions = [p for p in pos_map.values() if p.net_contracts != Decimal("0")]
+        open_markets_count = len(active_positions)
+        if active_positions:
+            snap_map = {s.ticker: s for s in snapshots}
+            has_significant_move = any(
+                (snap := snap_map.get(p.ticker)) is not None
+                and (
+                    (
+                        snap.mid_yes_price is not None
+                        and abs(snap.mid_yes_price - p.avg_entry_price) >= Decimal("0.10")
+                    )
+                    or (
+                        p.net_contracts > Decimal("0")
+                        and snap.best_yes_bid is not None
+                        and abs(snap.best_yes_bid - p.avg_entry_price) >= Decimal("0.10")
+                    )
+                    or (
+                        p.net_contracts < Decimal("0")
+                        and snap.best_yes_ask is not None
+                        and abs(snap.best_yes_ask - p.avg_entry_price) >= Decimal("0.10")
+                    )
+                )
+                for p in active_positions
+            )
+            if open_markets_count < self.settings.max_open_markets or has_significant_move:
+                return True, "open_position"
+            return False, "Event gate: waiting for spread/imbalance/heartbeat trigger"
 
         for snap in snapshots:
             spread = snap.yes_spread
@@ -577,6 +683,7 @@ class _LLMStrategyBase(BaseStrategy):
         portfolio: PortfolioState,
         pos_map: dict[str, Position],
     ) -> str:
+        self._record_mid_prices(snapshots)
         deployable = max(
             Decimal("0.00"),
             portfolio.current_equity_dollars
@@ -588,6 +695,9 @@ class _LLMStrategyBase(BaseStrategy):
             mid = snap.mid_yes_price
             prev_mid = self._last_llm_mids.get(snap.ticker)
             delta = (mid - prev_mid) if (mid is not None and prev_mid is not None) else Decimal("0")
+            delta_15s = self._mid_delta_over_window(snap.ticker, mid, 15.0)
+            delta_1m = self._mid_delta_over_window(snap.ticker, mid, 60.0)
+            delta_5m = self._mid_delta_over_window(snap.ticker, mid, 300.0)
             markets_payload.append(
                 {
                     "ticker": snap.ticker,
@@ -596,6 +706,9 @@ class _LLMStrategyBase(BaseStrategy):
                     "spread": str(snap.yes_spread),
                     "mid_price": str(mid) if mid is not None else None,
                     "price_delta_since_last": f"{delta:+.4f}",
+                    "mid_delta_15s": f"{delta_15s:+.4f}",
+                    "mid_delta_1m": f"{delta_1m:+.4f}",
+                    "mid_delta_5m": f"{delta_5m:+.4f}",
                     "imbalance": f"{self._compute_imbalance(snap):+.2f}",
                     "top3_yes_bids": [
                         [str(l.price), str(min(l.count, Decimal("500")))]
@@ -616,9 +729,10 @@ class _LLMStrategyBase(BaseStrategy):
             for k, p in pos_map.items()
             if p.net_contracts != Decimal("0")
         }
+        effective_max_pos = self._effective_max_pos(portfolio)
         payload = {
             "remaining_deployable_budget_dollars": f"{deployable:.2f}",
-            "max_position_dollars_per_market": str(self.settings.max_position_dollars_per_market),
+            "max_position_dollars_per_market": f"{effective_max_pos:.2f}",
             "open_positions": open_positions,
             "markets": markets_payload,
         }
@@ -628,7 +742,12 @@ class _LLMStrategyBase(BaseStrategy):
         )
 
     def _system_prompt(self) -> str:
-        return self.settings.system_prompt_override.strip() or DEFAULT_BATCH_SYSTEM_PROMPT
+        override = self.settings.system_prompt_override.strip()
+        if not override:
+            return DEFAULT_BATCH_SYSTEM_PROMPT
+        if "mid_delta_5m" not in override:
+            return f"{override} {MID_TREND_GUIDANCE}"
+        return override
 
     def _parse_batch_intents(
         self,
@@ -636,9 +755,18 @@ class _LLMStrategyBase(BaseStrategy):
         snapshots: list[OrderbookSnapshot],
         latency_ms: int,
         blocked_tickers: set[str] | None = None,
+        positions_by_ticker: dict[str, Position] | None = None,
     ) -> list[TradeIntent]:
         snap_map = {s.ticker: s for s in snapshots}
-        blocked = set(blocked_tickers) if blocked_tickers else set()
+        pos_map = positions_by_ticker or {}
+        blocked_resting = set(blocked_tickers) if blocked_tickers else set()
+        seen_tickers: set[str] = set()
+        active_hour_keys: set[str] = set()
+        for k, p in pos_map.items():
+            if p.net_contracts != Decimal("0"):
+                hk = extract_underlying_expiry_hour(k)
+                if hk is not None:
+                    active_hour_keys.add(hk)
         max_slip_dollars = self.settings.max_slippage_cents / Decimal("100")
         try:
             text = raw_text.strip()
@@ -662,13 +790,39 @@ class _LLMStrategyBase(BaseStrategy):
                 if str(item.get("action", "trade")).lower() == "hold":
                     continue
                 ticker = str(item.get("ticker", ""))
-                if not ticker or ticker in blocked:
+                if not ticker or ticker in seen_tickers:
                     continue
                 snap = snap_map.get(ticker)
                 if snap is None or snap.best_yes_bid is None or snap.best_yes_ask is None:
                     continue
-                blocked.add(ticker)
                 side = OrderSide(str(item["side"]).lower())
+                existing_pos = pos_map.get(ticker)
+                has_open_pos = (
+                    existing_pos is not None and existing_pos.net_contracts != Decimal("0")
+                )
+                is_reducing_exit = False
+                if has_open_pos and existing_pos is not None:
+                    if (
+                        existing_pos.net_contracts > Decimal("0") and side == OrderSide.ASK
+                    ) or (
+                        existing_pos.net_contracts < Decimal("0") and side == OrderSide.BID
+                    ):
+                        is_reducing_exit = True
+                    else:
+                        # Same-direction pyramiding when already holding a position is strictly blocked
+                        continue
+                elif ticker in blocked_resting:
+                    continue
+                else:
+                    hk = extract_underlying_expiry_hour(ticker)
+                    if hk is not None and hk in active_hour_keys:
+                        continue
+
+                # Block if a resting order is already active on this ticker
+                if ticker in blocked_resting and positions_by_ticker is not None:
+                    continue
+
+                seen_tickers.add(ticker)
                 raw_price = Decimal(str(item["limit_price"]))
                 # Abort if live inside quote moved > max_slippage past AI reference price;
                 # otherwise clamp limit_price to at most inside_ask + $0.01 on that side.
@@ -705,13 +859,22 @@ class _LLMStrategyBase(BaseStrategy):
                         raw_price - max_slip_dollars,
                     )
 
-                if not (
+                if not is_reducing_exit and not (
                     Decimal("0.15") <= limit_px <= Decimal("0.85")
                     and Decimal("0.15") <= (Decimal("1.00") - limit_px) <= Decimal("0.85")
                 ):
                     continue
 
                 count_dec = Decimal(str(item["count"]))
+                if is_reducing_exit and existing_pos is not None:
+                    count_dec = min(count_dec, abs(existing_pos.net_contracts))
+                    if count_dec <= Decimal("0"):
+                        continue
+                else:
+                    hk = extract_underlying_expiry_hour(ticker)
+                    if hk is not None:
+                        active_hour_keys.add(hk)
+
                 if "expected_edge_per_contract" in item and item["expected_edge_per_contract"] is not None:
                     edge_per_c = Decimal(str(item["expected_edge_per_contract"]))
                     total_edge = (edge_per_c * count_dec).quantize(Decimal("0.01"))
@@ -733,7 +896,7 @@ class _LLMStrategyBase(BaseStrategy):
                         limit_price=limit_px,
                         expected_edge_dollars=total_edge,
                         expected_edge_per_contract=edge_per_c,
-                        hold_to_expiry=bool(item.get("hold_to_expiry", False)),
+                        hold_to_expiry=False if is_reducing_exit else bool(item.get("hold_to_expiry", False)),
                         confidence=Decimal(str(item.get("confidence", "0.50"))),
                         inference_latency_ms=latency_ms,
                         rationale=str(item.get("rationale", "LLM batch signal"))[:400],
@@ -768,6 +931,7 @@ class _LLMStrategyBase(BaseStrategy):
             return BatchEvaluationResult()
 
         pos_map = positions_by_ticker if positions_by_ticker is not None else portfolio.positions
+        self._record_mid_prices(snapshots)
         ts_ms = int(time.time() * 1000)
 
         def _hold_batch(reason: str) -> BatchEvaluationResult:
@@ -829,11 +993,12 @@ class _LLMStrategyBase(BaseStrategy):
             cost_usd = estimate_llm_cost_usd(
                 self.provider_name, self.settings.llm_model, p_tok, c_tok
             )
-            blocked_tickers = {
-                k for k, p in pos_map.items() if p.net_contracts != Decimal("0")
-            } | set(portfolio.resting_order_tickers)
             intents = self._parse_batch_intents(
-                raw_text, snapshots, latency_ms, blocked_tickers=blocked_tickers
+                raw_text,
+                snapshots,
+                latency_ms,
+                blocked_tickers=set(portfolio.resting_order_tickers),
+                positions_by_ticker=pos_map,
             )
 
             decisions: list[dict[str, Any]] = []

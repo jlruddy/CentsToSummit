@@ -222,6 +222,19 @@
           <span class="text-slate-400 text-xs" x-text="cards.risk ? '▲' : '▼'"></span>
         </button>
         <div x-show="cards.risk" class="p-4 border-t border-slate-800 grid grid-cols-2 gap-3 text-xs">
+          <div class="col-span-2 flex items-center justify-between bg-slate-950/70 border border-slate-800 rounded-lg px-3 py-2">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" x-model="config.dynamic_sizing_enabled" class="rounded bg-slate-950 border-slate-700 text-sky-500" />
+              <span class="font-medium text-slate-200">Auto-Scale Position Size w/ House Money</span>
+            </label>
+            <span x-show="status.effective_max_position_dollars" class="font-mono text-emerald-400">
+              Cap: $<span x-text="status.effective_max_position_dollars"></span>
+            </span>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">House Money Risk Pct</label>
+            <input type="text" x-model="config.house_money_risk_pct" placeholder="0.20" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
+          </div>
           <div>
             <label class="block text-slate-400 mb-1">Max Position / Market ($)</label>
             <input type="text" x-model="config.max_position_dollars_per_market" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
@@ -238,7 +251,7 @@
             <label class="block text-slate-400 mb-1">Min Net Edge ($)</label>
             <input type="text" x-model="config.min_net_edge_dollars" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
           </div>
-          <div class="col-span-2">
+          <div>
             <label class="block text-slate-400 mb-1">Max Slippage (cents)</label>
             <input type="text" x-model="config.max_slippage_cents" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono" />
           </div>
@@ -255,6 +268,10 @@
           <label class="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" x-model="config.enforce_financial_only" class="rounded bg-slate-950 border-slate-700 text-sky-500" />
             <span>Enforce financial-only series allowlist</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="config.prefer_15m_turnover" class="rounded bg-slate-950 border-slate-700 text-sky-500" />
+            <span>Prioritize 15M Fast-Settlement Series</span>
           </label>
           <div>
             <label class="block text-slate-400 mb-1.5">Allowed Series Prefixes</label>
@@ -523,12 +540,15 @@
           daily_drawdown_kill_switch: '500.00',
           poll_interval_ms: 1000,
           max_position_dollars_per_market: '250.00',
+          dynamic_sizing_enabled: true,
+          house_money_risk_pct: '0.20',
           max_open_markets: 5,
           max_orders_per_minute: 10,
           min_net_edge_dollars: '0.02',
           max_slippage_cents: '3',
           allowed_series_prefixes: ['KXBTC', 'KXETH', 'KXINX', 'KXFED', 'KXCPI'],
           enforce_financial_only: true,
+          prefer_15m_turnover: true,
           strategy_provider: 'stub_momentum',
           llm_api_key: '',
           llm_endpoint: '',

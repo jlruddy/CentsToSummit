@@ -35,6 +35,7 @@ async def test_strategy_sizes_down_to_remaining_budget_and_passes_risk_gate() ->
         initial_capital=Decimal("12.00"),
         equity_floor=Decimal("10.50"),  # $1.50 deployable -> affords 2 contracts @ $0.51 + fee
         max_position_dollars_per_market=Decimal("2.50"),
+        dynamic_sizing_enabled=False,
     )
     strat = StubMomentumStrategy(settings)
     gate = RiskGate(settings)
@@ -295,3 +296,120 @@ async def test_level1_imbalance_ignores_deep_outliers_and_clamps_crossing_price(
         res = await strat.evaluate_batch([snap], portfolio, force=True)
     assert len(res.intents) == 1
     assert res.intents[0].limit_price == Decimal("0.5100")
+
+
+async def test_llm_rolling_mid_trends_reducing_exits_and_full_slot_gate() -> None:
+    import json
+    from kalshi_poc.models import StrategyProvider
+    from kalshi_poc.strategy_ai import GeminiStrategy
+
+    settings = AppSettings(
+        _env_file=None,
+        strategy_provider=StrategyProvider.GEMINI,
+        llm_api_key="test-key",
+        max_open_markets=1,
+        llm_min_cooldown_sec=15,
+        llm_heartbeat_sec=60,
+    )
+    strat = GeminiStrategy(settings)
+    assert "mid_delta_5m" in strat._system_prompt()
+
+    t0_ms = 1700000000000
+    snap_0 = OrderbookSnapshot(
+        ticker="KXETH15M-26NOV171915-15",
+        timestamp_ms=t0_ms,
+        yes_bids=[PriceLevel(price=Decimal("0.54"), count=Decimal("20"))],
+        no_bids=[PriceLevel(price=Decimal("0.44"), count=Decimal("20"))],  # mid = 0.55
+    )
+    snap_1m = OrderbookSnapshot(
+        ticker="KXETH15M-26NOV171915-15",
+        timestamp_ms=t0_ms + 240_000,
+        yes_bids=[PriceLevel(price=Decimal("0.50"), count=Decimal("20"))],
+        no_bids=[PriceLevel(price=Decimal("0.48"), count=Decimal("20"))],  # mid = 0.51
+    )
+    snap_5m = OrderbookSnapshot(
+        ticker="KXETH15M-26NOV171915-15",
+        timestamp_ms=t0_ms + 300_000,
+        yes_bids=[PriceLevel(price=Decimal("0.47"), count=Decimal("20"))],
+        no_bids=[PriceLevel(price=Decimal("0.51"), count=Decimal("20"))],  # mid = 0.48
+    )
+    strat._record_mid_prices([snap_0])
+    strat._record_mid_prices([snap_1m])
+
+    portfolio = PortfolioState(
+        cash_balance_dollars=Decimal("100.00"),
+        starting_capital_dollars=Decimal("100.00"),
+        daily_start_equity_dollars=Decimal("100.00"),
+        positions={
+            "KXETH15M-26NOV171915-15": Position(
+                ticker="KXETH15M-26NOV171915-15",
+                net_contracts=Decimal("3"),
+                avg_entry_price=Decimal("0.50"),
+                cost_basis_dollars=Decimal("1.50"),
+            )
+        },
+    )
+    prompt = strat._build_batch_prompt([snap_5m], portfolio, portfolio.positions)
+    assert '"mid_delta_1m": "-0.0300"' in prompt
+    assert '"mid_delta_5m": "-0.0700"' in prompt
+
+    # Full slots (1/1) with < $0.10 move from entry ($0.48 vs $0.50) must NOT trigger open_position
+    strat._last_llm_call_monotonic = strat._last_llm_call_monotonic or (
+        __import__("time").monotonic() - 20.0
+    )
+    should_call, reason = strat._should_trigger_llm([snap_5m], portfolio.positions, force=False)
+    assert should_call is False
+    assert "Event gate" in reason
+
+    # Once position moves >= $0.10 from entry ($0.62 vs $0.50), open_position triggers even when slots full
+    snap_moved = OrderbookSnapshot(
+        ticker="KXETH15M-26NOV171915-15",
+        timestamp_ms=t0_ms + 310_000,
+        yes_bids=[PriceLevel(price=Decimal("0.61"), count=Decimal("20"))],
+        no_bids=[PriceLevel(price=Decimal("0.37"), count=Decimal("20"))],  # mid = 0.62
+    )
+    should_call_2, reason_2 = strat._should_trigger_llm(
+        [snap_moved], portfolio.positions, force=False
+    )
+    assert should_call_2 is True
+    assert reason_2 == "open_position"
+
+    # _parse_batch_intents allows reducing ASK (capped at abs(net_contracts)=3) and blocks same-dir BID
+    raw_pyramid = json.dumps(
+        [
+            {
+                "ticker": "KXETH15M-26NOV171915-15",
+                "side": "bid",
+                "count": "2",
+                "limit_price": "0.63",
+                "expected_edge_per_contract": "0.06",
+            }
+        ]
+    )
+    assert (
+        strat._parse_batch_intents(
+            raw_pyramid, [snap_moved], 10, positions_by_ticker=portfolio.positions
+        )
+        == []
+    )
+
+    raw_exit = json.dumps(
+        [
+            {
+                "ticker": "KXETH15M-26NOV171915-15",
+                "side": "ask",
+                "count": "5",
+                "limit_price": "0.61",
+                "expected_edge_per_contract": "0.05",
+                "hold_to_expiry": True,
+            }
+        ]
+    )
+    parsed_exits = strat._parse_batch_intents(
+        raw_exit, [snap_moved], 10, positions_by_ticker=portfolio.positions
+    )
+    assert len(parsed_exits) == 1
+    assert parsed_exits[0].side == OrderSide.ASK
+    assert parsed_exits[0].count == Decimal("3")
+    assert parsed_exits[0].hold_to_expiry is False
+
