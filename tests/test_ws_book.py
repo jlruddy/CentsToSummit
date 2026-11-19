@@ -100,3 +100,30 @@ async def test_disconnect_drops_books_built_from_the_stream() -> None:
     await ws._handle_message(_snapshot(9, 1, "T-A"))
     await ws._handle_message(_delta(9, 2, "T-A", "0.49", "5"))
     assert ws.orderbooks["T-A"].best_yes_bid == Decimal("0.4900")
+
+
+async def test_subscribe_ok_frame_consumes_seq_without_false_gap() -> None:
+    """Captured from Kalshi: adding a ticker to a live subscription answers with an "ok" frame
+    on the orderbook sid that carries a seq; the new ticker's snapshot uses the next seq."""
+    ws = KalshiWebSocketClient(ws_url="wss://example.invalid")
+    fake_socket = AsyncMock()
+    ws._ws = fake_socket
+    ws.connected = True
+    ws.tickers = ["T-A", "T-B"]
+    await ws._handle_message(_snapshot(1, 1, "T-A"))
+    await ws._handle_message(_delta(1, 2, "T-A", "0.49", "5"))
+    # ok frames on the fill / ticker sids carry no seq; the orderbook one does
+    await ws._handle_message(json.dumps({"type": "ok", "id": 2, "sid": 3, "msg": {"market_tickers": ["T-A", "T-B"]}}))
+    await ws._handle_message(json.dumps({"type": "ok", "id": 2, "sid": 1, "seq": 3, "msg": {"market_tickers": ["T-A", "T-B"]}}))
+    await ws._handle_message(_snapshot(1, 4, "T-B"))
+    await ws._handle_message(_delta(1, 5, "T-A", "0.50", "5"))
+
+    assert ws.seq_gap_count == 0
+    fake_socket.close.assert_not_awaited()
+    assert set(ws.orderbooks) == {"T-A", "T-B"}
+    assert ws.orderbooks["T-A"].best_yes_bid == Decimal("0.5000")
+
+    # A real loss is still caught
+    await ws._handle_message(_delta(1, 7, "T-A", "0.47", "-10"))
+    assert ws.seq_gap_count == 1
+    fake_socket.close.assert_awaited_once()
