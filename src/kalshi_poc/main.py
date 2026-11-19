@@ -30,6 +30,7 @@ from kalshi_poc.models import (
     PortfolioState,
     Position,
     RiskEvaluation,
+    StrategyProvider,
     TradeIntent,
     V2CreateOrderRequest,
 )
@@ -1902,6 +1903,16 @@ async def run_orchestrator(host: str | None = None, port: int | None = None, con
     if s.execution_mode == ExecutionMode.LIVE and not confirm_live:
         logger.warning(
             "EXECUTION_MODE=live requires --confirm-live flag on CLI; defaulting to paused for safety."
+        )
+        cfg_mgr.update_and_persist({"execution_mode": ExecutionMode.PAUSED.value})
+        s = cfg_mgr.settings
+    elif (
+        s.execution_mode == ExecutionMode.LIVE
+        and s.strategy_provider == StrategyProvider.STUB_MOMENTUM
+    ):
+        logger.warning(
+            "EXECUTION_MODE=live with STRATEGY_PROVIDER=stub_momentum is not allowed; "
+            "defaulting to paused for safety."
         )
         cfg_mgr.update_and_persist({"execution_mode": ExecutionMode.PAUSED.value})
         s = cfg_mgr.settings

@@ -263,6 +263,14 @@ class ConfigManager:
                     "execution_mode=live is disabled: restart with `kalshi-poc run --confirm-live` "
                     "to allow real-money trading."
                 )
+            if (
+                new_settings.execution_mode == ExecutionMode.LIVE
+                and new_settings.strategy_provider == StrategyProvider.STUB_MOMENTUM
+            ):
+                raise ValueError(
+                    "execution_mode=live is blocked with strategy_provider=stub_momentum: "
+                    "the stub is a test strategy; select a model provider before going live."
+                )
 
             self._persist_files(new_settings)
             self._settings = new_settings

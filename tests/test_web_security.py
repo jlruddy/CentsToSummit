@@ -35,7 +35,20 @@ def test_live_mode_rejected_without_confirm_live(tmp_path: Path) -> None:
 
 def test_live_mode_allowed_with_confirm_live(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path, allow_live=True)
-    assert cfg.update_and_persist({"execution_mode": "live"}).execution_mode.value == "live"
+    s = cfg.update_and_persist({"execution_mode": "live", "strategy_provider": "gemini"})
+    assert s.execution_mode.value == "live"
+
+
+def test_live_mode_blocked_with_stub_strategy(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, allow_live=True)
+    with pytest.raises(ValueError, match="stub_momentum"):
+        cfg.update_and_persist({"execution_mode": "live"})  # default provider is the stub
+    assert cfg.settings.execution_mode.value == "paused"
+    # Switching to the stub while live is blocked too
+    cfg.update_and_persist({"execution_mode": "live", "strategy_provider": "gemini"})
+    with pytest.raises(ValueError, match="stub_momentum"):
+        cfg.update_and_persist({"strategy_provider": "stub_momentum"})
+    assert cfg.settings.strategy_provider.value == "gemini"
 
 
 def test_foreign_host_header_rejected(tmp_path: Path) -> None:

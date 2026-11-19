@@ -1105,6 +1105,7 @@ async def test_portfolio_sync_drops_expired_positions_reaps_resting_orders_and_s
         {
             "kalshi_environment": "production",
             "execution_mode": "live",
+            "strategy_provider": "gemini",
             "initial_capital": "25.00",
             "equity_floor": "15.00",
             "max_open_markets": 5,
@@ -1281,6 +1282,7 @@ async def test_bidirectional_shard_transfer_dynamic_sizing_and_per_contract_edge
         {
             "kalshi_environment": "production",
             "execution_mode": "live",
+            "strategy_provider": "gemini",
             "initial_capital": "70.28",
             "equity_floor": "5.00",
             "max_position_dollars_per_market": "4.00",

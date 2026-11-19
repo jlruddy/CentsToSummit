@@ -542,9 +542,12 @@
                   <div>
                     <span class="font-bold" x-text="ev.data.ticker"></span> [<span x-text="ev.data.mode"></span>] |
                     Order <span x-text="ev.data.order_id"></span> |
+                    Qty <span x-text="ev.data.count"></span> |
                     Fill $<span x-text="ev.data.fill_price"></span> |
-                    Slippage $<span x-text="ev.data.slippage_dollars"></span> |
-                    Fee $<span x-text="ev.data.fee_dollars"></span> |
+                    Slippage <span x-text="perContractCents(ev.data.slippage_dollars, ev.data.count)"></span>/c
+                    ($<span x-text="ev.data.slippage_dollars"></span> total) |
+                    Fee $<span x-text="ev.data.fee_dollars"></span>
+                    (<span x-text="perContractCents(ev.data.fee_dollars, ev.data.count)"></span>/c) |
                     <span class="font-semibold" x-text="ev.data.status"></span>
                   </div>
                   <div x-show="ev.data.error_message" class="text-rose-400 mt-1 text-[11px]" x-text="ev.data.error_message"></div>
@@ -579,6 +582,13 @@
   <script>
     function dashboard() {
       return {
+        // Order totals -> per-contract cents, comparable to the Max Slippage (cents) setting
+        perContractCents(totalDollars, count) {
+          const total = parseFloat(totalDollars);
+          const n = parseFloat(count);
+          if (!isFinite(total) || !isFinite(n) || n <= 0) return '—';
+          return (total / n * 100).toFixed(2) + '¢';
+        },
         cards: { creds: true, exec: true, risk: false, tax: false, ai: false },
         config: {
           kalshi_environment: 'demo',
