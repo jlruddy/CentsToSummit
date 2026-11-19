@@ -231,3 +231,7 @@ data/
 *.pem
 config.json
 
+
+# replay research output
+scripts/replay/settle.txt
+scripts/replay/__pycache__/

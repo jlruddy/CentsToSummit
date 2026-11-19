@@ -1312,6 +1312,7 @@ class TradingEngine:
             self.portfolio,
             positions_by_ticker=self.portfolio.positions,
             force=force,
+            market_expiries=self._market_expiries,
         )
         if batch.llm_call is not None:
             await self.telemetry.log_llm_call(batch.llm_call)

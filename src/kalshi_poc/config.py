@@ -67,6 +67,12 @@ class AppSettings(BaseSettings):
     # After any approved exit, block new entries in that same market for this many seconds (0 = off).
     reentry_cooldown_secs: int = Field(default=60, ge=0, le=3600)
 
+    # Deterministic filters on new LLM entries (0 = off). Own side = YES price for bids, 1 - price
+    # for asks. Shadow replay showed cheap (<0.60) entries and 1m-spike chasing were the losers.
+    min_entry_price_own_side: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), lt=Decimal("1"))
+    # Reject an entry when the 1-minute mid move already in the trade's direction is >= this.
+    anti_chase_max_move_1m: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), le=Decimal("1"))
+
     # Tax-Hygiene Allowlist & Discovery Priority
     allowed_series_prefixes: list[str] = Field(
         default_factory=lambda: ["KXBTC", "KXETH", "KXINX", "KXFED", "KXCPI"]
@@ -84,6 +90,8 @@ class AppSettings(BaseSettings):
     system_prompt_override: str = Field(default="")
     llm_min_cooldown_sec: int = Field(default=15, ge=0, le=3600)
     llm_heartbeat_sec: int = Field(default=60, ge=1, le=86400)
+    # Calling the LLM right after a >=2c mid move selected for momentum chasing; off by default.
+    llm_mid_move_trigger_enabled: bool = Field(default=False)
 
     # Telemetry & Web Server
     db_path: str = Field(default="data/kalshi_telemetry.db")
@@ -310,6 +318,8 @@ class ConfigManager:
             f"TRAILING_STOP_ACTIVATION_GAIN={s.trailing_stop_activation_gain}",
             f"TRAILING_STOP_DISTANCE={s.trailing_stop_distance}",
             f"REENTRY_COOLDOWN_SECS={s.reentry_cooldown_secs}",
+            f"MIN_ENTRY_PRICE_OWN_SIDE={s.min_entry_price_own_side}",
+            f"ANTI_CHASE_MAX_MOVE_1M={s.anti_chase_max_move_1m}",
             f"ALLOWED_SERIES_PREFIXES={json.dumps(s.allowed_series_prefixes)}",
             f"ENFORCE_FINANCIAL_ONLY={str(s.enforce_financial_only).lower()}",
             f"PREFER_15M_TURNOVER={str(s.prefer_15m_turnover).lower()}",
@@ -322,6 +332,7 @@ class ConfigManager:
             f"SYSTEM_PROMPT_OVERRIDE={_q(s.system_prompt_override)}",
             f"LLM_MIN_COOLDOWN_SEC={s.llm_min_cooldown_sec}",
             f"LLM_HEARTBEAT_SEC={s.llm_heartbeat_sec}",
+            f"LLM_MID_MOVE_TRIGGER_ENABLED={str(s.llm_mid_move_trigger_enabled).lower()}",
             f"DB_PATH={_q(s.db_path)}",
             f"WEB_HOST={_q(s.web_host)}",
             f"WEB_PORT={s.web_port}",
