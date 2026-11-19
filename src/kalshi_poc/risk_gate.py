@@ -50,6 +50,10 @@ def extract_underlying_expiry_hour(ticker: str) -> str | None:
         underlying = raw
 
     dt_token = parts[1]
+    # Index range markets (KXINXU, KXNASDAQ100U) encode the hour as YYMMMDD + "H" + HHMM
+    # (e.g. 26NOV19H1600); normalize to YYMMMDDHH like crypto tickers (26NOV1916).
+    if len(dt_token) >= 10 and dt_token[7] == "H" and dt_token[8:10].isdigit():
+        dt_token = dt_token[:7] + dt_token[8:10]
     if len(dt_token) >= 9 and dt_token[:2].isdigit() and dt_token[5:9].isdigit():
         return f"{underlying}:{dt_token[:9]}"
     return None
