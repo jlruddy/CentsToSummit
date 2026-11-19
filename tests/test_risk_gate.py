@@ -507,3 +507,40 @@ def test_reentry_cooldown_zero_disables() -> None:
     portfolio.positions.pop(ticker)
     res = gate.evaluate(_make_intent(), _make_snapshot(), portfolio, now_ms=t0 + 1_000)
     assert not any("cooldown" in r.lower() for r in res.rejection_reasons)
+
+
+def test_correlation_key_parses_index_hour_tickers() -> None:
+    from kalshi_poc.risk_gate import extract_underlying_expiry_hour as key
+
+    # Index range markets put an "H" before the hour; it previously returned None (no gating)
+    assert key("KXINXU-26NOV19H1600-T7189.9999") == "INX:26NOV1916"
+    assert key("KXINXU-26NOV19H1600-T7184.9999") == "INX:26NOV1916"
+    assert key("KXINXU-26NOV19H1500-T7229.9999") == "INX:26NOV1915"
+    assert key("KXNASDAQ100U-26NOV18H1600-T27099.99") == "NASDAQ:26NOV1816"
+    # Crypto formats unchanged
+    assert key("KXBTCD-26NOV1916-T62199.99") == "BTC:26NOV1916"
+    assert key("KXETH15M-26NOV191515-15") == "ETH:26NOV1915"
+    assert key("KXINXU-26NOV19") is None
+
+
+def test_risk_gate_blocks_second_inxu_strike_same_hour() -> None:
+    settings = AppSettings(_env_file=None, allowed_series_prefixes=["KXINXU"])
+    held = "KXINXU-26NOV19H1600-T7189.9999"
+    target = "KXINXU-26NOV19H1600-T7184.9999"
+    portfolio = _make_portfolio()
+    portfolio.positions[held] = Position(
+        ticker=held, net_contracts=Decimal("-19"), avg_entry_price=Decimal("0.39"),
+        cost_basis_dollars=Decimal("11.59"),
+    )
+    res = RiskGate(settings).evaluate(
+        _make_intent(ticker=target), _make_snapshot(ticker=target), portfolio
+    )
+    assert res.approved is False
+    assert any("Correlated underlying" in r for r in res.rejection_reasons)
+
+    # A different expiry hour on the same index is still allowed by this rule
+    other_hour = "KXINXU-26NOV19H1700-T7184.9999"
+    res2 = RiskGate(settings).evaluate(
+        _make_intent(ticker=other_hour), _make_snapshot(ticker=other_hour), portfolio
+    )
+    assert not any("Correlated underlying" in r for r in res2.rejection_reasons)
