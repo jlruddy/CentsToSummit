@@ -430,3 +430,13 @@ async def test_llm_total_edge_dollars_is_not_guessed_as_per_contract() -> None:
     assert len(intents) == 1
     assert intents[0].expected_edge_dollars == Decimal("0.15")
     assert intents[0].expected_edge_per_contract == Decimal("0.0150")
+
+
+def test_normalize_gemini_model_accepts_display_and_resource_names() -> None:
+    from kalshi_poc.strategy_ai import normalize_gemini_model
+
+    assert normalize_gemini_model("Gemini 3.8 Flash") == "gemini-3.8-flash"
+    assert normalize_gemini_model("models/gemini-3.8-flash") == "gemini-3.8-flash"
+    assert normalize_gemini_model(" gemini-3.8-flash ") == "gemini-3.8-flash"
+    assert normalize_gemini_model("") == "gemini-2.5-flash"
+    assert normalize_gemini_model(None) == "gemini-2.5-flash"

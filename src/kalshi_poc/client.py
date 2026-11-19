@@ -973,15 +973,19 @@ class KalshiWebSocketClient:
         if not ticker and sid is not None:
             ticker = self._sid_to_ticker.get(int(sid))
 
+        # Track seq on every frame that carries one, not just book frames: adding tickers to a
+        # live subscription returns an "ok" frame that consumes a seq on the orderbook sid.
+        # Skipping it made every subscription change look like a gap and recycle the socket.
+        seq = data.get("seq")
+        if sid is not None and seq is not None:
+            sid_i, seq_i = int(sid), int(seq)
+            prev = self._sid_last_seq.get(sid_i)
+            if prev is not None and seq_i != prev + 1:
+                await self._handle_seq_gap(sid_i, prev + 1, seq_i)
+                return
+            self._sid_last_seq[sid_i] = seq_i
+
         if msg_type in ("orderbook_snapshot", "orderbook_delta"):
-            seq = data.get("seq")
-            if sid is not None and seq is not None:
-                sid_i, seq_i = int(sid), int(seq)
-                prev = self._sid_last_seq.get(sid_i)
-                if prev is not None and seq_i != prev + 1:
-                    await self._handle_seq_gap(sid_i, prev + 1, seq_i)
-                    return
-                self._sid_last_seq[sid_i] = seq_i
             if ticker and sid is not None:
                 self._sid_tickers.setdefault(int(sid), set()).add(str(ticker))
 

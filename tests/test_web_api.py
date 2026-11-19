@@ -772,7 +772,8 @@ async def test_v2_order_endpoints_cancellation_and_fill_reconciliation(tmp_path:
             "fill_count": "4",
             "remaining_count": "0",
             "average_fill_price": "0.4800",
-            "average_fee_paid": "0.07",
+            # Per-contract average (taker fee ceil(0.07*4*0.48*0.52) = $0.07 total / 4)
+            "average_fee_paid": "0.0175",
             "ts_ms": 1700000001000,
         }
         with (
@@ -1104,6 +1105,7 @@ async def test_portfolio_sync_drops_expired_positions_reaps_resting_orders_and_s
         {
             "kalshi_environment": "production",
             "execution_mode": "live",
+            "strategy_provider": "gemini",
             "initial_capital": "25.00",
             "equity_floor": "15.00",
             "max_open_markets": 5,
@@ -1280,6 +1282,7 @@ async def test_bidirectional_shard_transfer_dynamic_sizing_and_per_contract_edge
         {
             "kalshi_environment": "production",
             "execution_mode": "live",
+            "strategy_provider": "gemini",
             "initial_capital": "70.28",
             "equity_floor": "5.00",
             "max_position_dollars_per_market": "4.00",

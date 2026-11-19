@@ -966,6 +966,7 @@ class _LLMStrategyBase(BaseStrategy):
                     side=side,
                     count=count_dec,
                     limit_price=limit_px,
+                    reference_price=raw_price,
                     expected_edge_dollars=total_edge,
                     expected_edge_per_contract=edge_per_c,
                     hold_to_expiry=False if is_reducing_exit else bool(item.get("hold_to_expiry", False)),
@@ -1076,10 +1077,17 @@ class _LLMStrategyBase(BaseStrategy):
                 status_code = exc.response.status_code
                 if status_code in (401, 402, 403):
                     self._last_llm_call_monotonic = time.monotonic() + 60.0
+                try:
+                    detail = exc.response.text[:300]
+                except Exception:
+                    detail = ""
                 logger.warning(
-                    "%s HTTP %s error during batch inference", self.provider_name, status_code
+                    "%s HTTP %s error during batch inference: %s",
+                    self.provider_name,
+                    status_code,
+                    detail,
                 )
-                llm_call["error"] = f"HTTP {status_code}"
+                llm_call["error"] = f"HTTP {status_code}: {detail}"[:1000]
                 llm_call["latency_ms"] = max(1, int((time.perf_counter() - t0) * 1000))
                 return _hold_batch(
                     f"{self.provider_name} error: HTTP {status_code}", "LLM_ERROR", llm_call
@@ -1208,13 +1216,24 @@ class AnthropicStrategy(_LLMStrategyBase):
             return text, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
 
 
+def normalize_gemini_model(raw: str | None) -> str:
+    """Map a display name ("Gemini 3.8 Flash") or resource name ("models/gemini-3.8-flash") to
+    the API model id ("gemini-3.8-flash"); a display name in the URL path is rejected with 400."""
+    name = (raw or "").strip()
+    if not name:
+        return "gemini-2.5-flash"
+    if name.startswith("models/"):
+        name = name[len("models/"):]
+    return "-".join(name.lower().split())
+
+
 class GeminiStrategy(_LLMStrategyBase):
     provider_name = StrategyProvider.GEMINI.value
 
     async def _call_llm_batch(self, prompt: str) -> tuple[str, int, int]:
         if not self.settings.llm_api_key:
             raise ValueError("LLM API key not configured")
-        model = self.settings.llm_model or "gemini-2.5-flash"
+        model = normalize_gemini_model(self.settings.llm_model)
         endpoint = (
             self.settings.llm_endpoint
             or f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"

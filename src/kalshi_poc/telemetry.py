@@ -206,7 +206,12 @@ class TelemetryManager:
         ]
 
     async def get_recent_activity(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Return up to `limit` most recent AI_DECISION, RISK_GATE, and EXECUTION events (oldest-first)."""
+        """Return up to `limit` most recent AI_DECISION, RISK_GATE, and EXECUTION events (oldest-first).
+
+        Scoped to the active session: a restart or shadow reset rotates session_id, so prior runs'
+        events (e.g. a stale "Max open markets reached") are never replayed as current activity.
+        History stays in SQLite / Parquet exports.
+        """
         if self._db is None:
             return []
         events: list[dict[str, Any]] = []
@@ -218,10 +223,11 @@ class TelemetryManager:
                    rationale, prompt_tokens, completion_tokens, estimated_cost_usd,
                    decision_status
             FROM ai_decisions
+            WHERE session_id = ?
             ORDER BY timestamp_ms DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            (self.session_id, limit),
         ) as cur:
             for r in await cur.fetchall():
                 side_val = r[3]
@@ -259,10 +265,11 @@ class TelemetryManager:
                    estimated_entry_fee_dollars, estimated_round_trip_fee_dollars,
                    worst_case_equity_after
             FROM risk_evaluations
+            WHERE session_id = ?
             ORDER BY timestamp_ms DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            (self.session_id, limit),
         ) as cur:
             for r in await cur.fetchall():
                 events.append(
@@ -289,10 +296,11 @@ class TelemetryManager:
                    count, requested_price, fill_price, slippage_dollars, fee_dollars,
                    is_maker, status, shadow_fill_price, shadow_fee_dollars
             FROM orders_and_fills
+            WHERE session_id = ?
             ORDER BY timestamp_ms DESC, id DESC
             LIMIT ?
             """,
-            (limit,),
+            (self.session_id, limit),
         ) as cur:
             for r in await cur.fetchall():
                 events.append(
