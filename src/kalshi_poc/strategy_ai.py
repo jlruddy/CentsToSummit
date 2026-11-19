@@ -966,6 +966,7 @@ class _LLMStrategyBase(BaseStrategy):
                     side=side,
                     count=count_dec,
                     limit_price=limit_px,
+                    reference_price=raw_price,
                     expected_edge_dollars=total_edge,
                     expected_edge_per_contract=edge_per_c,
                     hold_to_expiry=False if is_reducing_exit else bool(item.get("hold_to_expiry", False)),

@@ -388,6 +388,9 @@ class TradeIntent(BaseModel):
     side: OrderSide
     count: Decimal = Field(gt=Decimal("0"))
     limit_price: Decimal = Field(gt=Decimal("0"), lt=Decimal("1"))
+    # YES-leg price the signal (and its expected edge) was computed against. Execution may move
+    # `limit_price` toward the live book, but never more than max_slippage past this reference.
+    reference_price: Decimal | None = Field(default=None, gt=Decimal("0"), lt=Decimal("1"))
     expected_edge_dollars: Decimal = Field(ge=Decimal("0"))
     expected_edge_per_contract: Decimal | None = Field(default=None, ge=Decimal("0"))
     hold_to_expiry: bool = False
@@ -469,6 +472,8 @@ class PortfolioState(BaseModel):
     positions: dict[str, Position] = Field(default_factory=dict)
     resting_order_collateral_dollars: Decimal = Field(default=Decimal("0.00"))
     resting_order_tickers: set[str] = Field(default_factory=set)
+    # Approved orders not yet confirmed as a position or resting order (in-flight submissions)
+    pending_order_tickers: set[str] = Field(default_factory=set)
     recent_order_timestamps_ms: list[int] = Field(default_factory=list)
     kill_switch_tripped: bool = False
 

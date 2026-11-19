@@ -172,9 +172,11 @@ class RiskGate:
                 f"Order rate limit reached ({len(recent_orders)}/{s.max_orders_per_minute} per min)"
             )
 
-        active_tickers = {
-            k for k, pos in portfolio.positions.items() if pos.net_contracts != Decimal("0")
-        } | set(portfolio.resting_order_tickers)
+        active_tickers = (
+            {k for k, pos in portfolio.positions.items() if pos.net_contracts != Decimal("0")}
+            | set(portfolio.resting_order_tickers)
+            | set(portfolio.pending_order_tickers)
+        )
 
         if not is_reducing_exit and intent.ticker not in active_tickers and len(active_tickers) >= s.max_open_markets:
             reasons.append(
@@ -204,7 +206,11 @@ class RiskGate:
                         f"(< {s.reentry_cooldown_secs}s)"
                     )
 
-        if intent.ticker in portfolio.resting_order_tickers:
+        if intent.ticker in portfolio.pending_order_tickers:
+            reasons.append(
+                f"Order already in flight on {intent.ticker} (awaiting fill confirmation)"
+            )
+        elif intent.ticker in portfolio.resting_order_tickers:
             reasons.append(
                 f"Active resting order already exists on {intent.ticker} (1 order per ticker limit)"
             )
@@ -237,6 +243,13 @@ class RiskGate:
         round_trip_fee = entry_fee * Decimal("2")
         slip_limit_cents = s.exit_max_slippage_cents if is_reducing_exit else s.max_slippage_cents
         max_slip_dollars = (slip_limit_cents / Decimal("100")).quantize(Decimal("0.0001"))
+        # Price the signal's edge was computed at; all drift is measured from here, never from a
+        # limit that execution has already re-priced toward the live book.
+        ref_price = intent.reference_price if intent.reference_price is not None else intent.limit_price
+        if intent.side == OrderSide.BID:
+            limit_drift = intent.limit_price - ref_price
+        else:
+            limit_drift = ref_price - intent.limit_price
 
         if snapshot is None:
             reasons.append(f"No live orderbook snapshot available for {intent.ticker}")
@@ -249,16 +262,20 @@ class RiskGate:
             if skip_slippage_bands:
                 pass
             elif intent.side == OrderSide.BID and (
-                snapshot.best_yes_ask - intent.limit_price
+                snapshot.best_yes_ask - ref_price
             ) > max_slip_dollars:
                 reasons.append(
-                    f"Live inside ask (${snapshot.best_yes_ask:.4f}) moved > max slippage (${max_slip_dollars:.2f}) past reference (${intent.limit_price:.4f})"
+                    f"Live inside ask (${snapshot.best_yes_ask:.4f}) moved > max slippage (${max_slip_dollars:.4f}) past reference (${ref_price:.4f})"
                 )
             elif intent.side == OrderSide.ASK and (
-                intent.limit_price - snapshot.best_yes_bid
+                ref_price - snapshot.best_yes_bid
             ) > max_slip_dollars:
                 reasons.append(
-                    f"Live inside bid (${snapshot.best_yes_bid:.4f}) moved > max slippage (${max_slip_dollars:.2f}) past reference (${intent.limit_price:.4f})"
+                    f"Live inside bid (${snapshot.best_yes_bid:.4f}) moved > max slippage (${max_slip_dollars:.4f}) past reference (${ref_price:.4f})"
+                )
+            if not skip_slippage_bands and limit_drift > max_slip_dollars:
+                reasons.append(
+                    f"Limit ${intent.limit_price:.4f} is more than max slippage (${max_slip_dollars:.4f}) past reference (${ref_price:.4f})"
                 )
 
             walk = walk_book(
@@ -274,12 +291,23 @@ class RiskGate:
                 entry_fee = calculate_taker_fee(intent.count, est_fill_price)
                 round_trip_fee = entry_fee * Decimal("2")
 
+                # Book-walk VWAP drift from the signal reference, per contract
+                if intent.side == OrderSide.BID:
+                    vwap_drift_per_c = max(Decimal("0"), est_fill_price - ref_price)
+                else:
+                    vwap_drift_per_c = max(Decimal("0"), ref_price - est_fill_price)
+
                 if (
                     not skip_slippage_bands
                     and walk.slippage_cents_per_contract > slip_limit_cents
                 ):
                     reasons.append(
                         f"Estimated slippage {walk.slippage_cents_per_contract}c exceeds max {slip_limit_cents}c"
+                    )
+                elif not skip_slippage_bands and vwap_drift_per_c > max_slip_dollars:
+                    reasons.append(
+                        f"Book-walk VWAP ${est_fill_price:.4f} is {vwap_drift_per_c * 100:.2f}c past reference "
+                        f"${ref_price:.4f} (max {slip_limit_cents}c)"
                     )
 
                 if not is_reducing_exit:
@@ -318,7 +346,9 @@ class RiskGate:
 
                     fee_per_c = (primary_fee / intent.count).quantize(Decimal("0.0001"))
                     slip_per_c = (est_slippage / intent.count).quantize(Decimal("0.0001"))
-                    friction_per_c = fee_per_c + slip_per_c
+                    # The edge was priced at ref_price: paying more than that costs edge 1:1.
+                    # Take the larger of mid-slippage and reference drift (not both: they overlap).
+                    friction_per_c = fee_per_c + max(slip_per_c, vwap_drift_per_c)
                     net_edge_per_c = gross_edge_per_c - friction_per_c
 
                     if friction_per_c >= gross_edge_per_c:

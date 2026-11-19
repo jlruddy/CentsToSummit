@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ from kalshi_poc.models import (
     OrderbookSnapshot,
     PortfolioState,
     Position,
+    RiskEvaluation,
     TradeIntent,
     V2CreateOrderRequest,
 )
@@ -52,6 +53,48 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("kalshi_poc")
 
 EXIT_RETRY_INTERVAL_SEC = 3.0
+
+
+def _to_dollars(raw: Any, *, cents: bool) -> Decimal:
+    val = Decimal(str(raw))
+    return val / Decimal("100") if cents else val
+
+
+def order_fee_total(order_obj: dict[str, Any], filled_qty: Decimal, fill_price: Decimal) -> Decimal:
+    """Total fee in dollars actually paid on an order's fills.
+
+    Prefers Kalshi's order-total fee fields (taker_fees/maker_fees, cents; *_dollars, dollars).
+    `average_fee_paid*` is a per-contract average, so it is scaled by the filled quantity; it
+    was previously recorded as the order total, under-counting fees by ~the contract count.
+    """
+    if filled_qty <= Decimal("0"):
+        return Decimal("0.00")
+    total: Decimal | None = None
+    for key, cents in (
+        ("taker_fees_dollars", False),
+        ("maker_fees_dollars", False),
+        ("taker_fees", True),
+        ("maker_fees", True),
+    ):
+        raw = order_obj.get(key)
+        if raw is None:
+            continue
+        # Dollar and cent variants of the same field describe the same fee; take one of each kind
+        if not cents or (key.replace("_fees", "_fees_dollars") not in order_obj):
+            total = (total or Decimal("0")) + _to_dollars(raw, cents=cents)
+    if total is not None:
+        return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    avg_raw = order_obj.get("average_fee_paid_dollars")
+    avg = _to_dollars(avg_raw, cents=False) if avg_raw is not None else None
+    if avg is None and order_obj.get("average_fee_paid") is not None:
+        avg = Decimal(str(order_obj["average_fee_paid"]))
+        if avg > Decimal("1"):
+            avg = avg / Decimal("100")  # legacy integer-cents encoding
+    if avg is not None:
+        return (avg * filled_qty).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    return calculate_taker_fee(filled_qty, fill_price)
 
 
 class TradingEngine:
@@ -1246,7 +1289,12 @@ class TradingEngine:
             s.execution_mode != ExecutionMode.PAUSED and not self.portfolio.kill_switch_tripped
         )
         if snapshots:
-            await self._process_batch(snapshots, s, execute_orders=execute_orders, force=True)
+            # Serialize with the engine loop: two overlapping batches could each approve the
+            # same ticker before either order is recorded.
+            async with self._engine_lock:
+                await self._process_batch(
+                    snapshots, s, execute_orders=execute_orders, force=True
+                )
 
         await self._broadcast_equity_and_status()
         return {"evaluated": len(snapshots), "execution_mode": s.execution_mode.value}
@@ -1305,22 +1353,30 @@ class TradingEngine:
     ) -> None:
         route = mode or s.execution_mode
         max_slip_dollars = (s.max_slippage_cents / Decimal("100")).quantize(Decimal("0.0001"))
+        # Pin the signal reference before any re-pricing so drift is always measured from the
+        # price the edge was computed at, never from an already-clamped limit.
+        if intent.reference_price is None:
+            intent = intent.model_copy(update={"reference_price": intent.limit_price})
+        ref_px = intent.reference_price
+        assert ref_px is not None
         if snap.best_yes_bid is not None and snap.best_yes_ask is not None:
             if intent.side == OrderSide.BID:
                 inside_ask = snap.best_yes_ask
-                if (inside_ask - intent.limit_price) <= max_slip_dollars:
+                if (inside_ask - ref_px) <= max_slip_dollars:
                     clamped_px = min(
                         max(intent.limit_price, inside_ask),
                         inside_ask + Decimal("0.01"),
+                        (ref_px + max_slip_dollars).quantize(Decimal("0.01"), rounding=ROUND_FLOOR),
                     )
                     if clamped_px != intent.limit_price:
                         intent = intent.model_copy(update={"limit_price": clamped_px})
             else:
                 inside_bid = snap.best_yes_bid
-                if (intent.limit_price - inside_bid) <= max_slip_dollars:
+                if (ref_px - inside_bid) <= max_slip_dollars:
                     clamped_px = max(
                         min(intent.limit_price, inside_bid),
                         inside_bid - Decimal("0.01"),
+                        (ref_px - max_slip_dollars).quantize(Decimal("0.01"), rounding=ROUND_CEILING),
                     )
                     if clamped_px != intent.limit_price:
                         intent = intent.model_copy(update={"limit_price": clamped_px})
@@ -1338,11 +1394,28 @@ class TradingEngine:
             seconds_to_expiry=seconds_to_expiry,
             emergency_exit=emergency,
         )
-        await self.telemetry.log_risk_evaluation(evaluation)
+        # Claim the ticker synchronously with the approval, before any await, so a concurrent
+        # evaluation cannot also pass the gate until this order is recorded as a position or a
+        # resting order (or fails).
+        claimed = evaluation.approved and execute_orders
+        if claimed:
+            self.portfolio.pending_order_tickers.add(intent.ticker)
+        try:
+            await self.telemetry.log_risk_evaluation(evaluation)
+            if claimed:
+                await self._execute_approved_intent(intent, snap, s, route, evaluation)
+        finally:
+            if claimed:
+                self.portfolio.pending_order_tickers.discard(intent.ticker)
 
-        if not evaluation.approved or not execute_orders:
-            return
-
+    async def _execute_approved_intent(
+        self,
+        intent: TradeIntent,
+        snap: OrderbookSnapshot,
+        s: AppSettings,
+        route: ExecutionMode,
+        evaluation: RiskEvaluation,
+    ) -> None:
         if route == ExecutionMode.SHADOW:
             rec = self.simulator.simulate_fill(
                 intent, snap, portfolio=self.portfolio, mode=ExecutionMode.SHADOW
@@ -1471,11 +1544,6 @@ class TradingEngine:
                     if order_obj.get("average_fill_price") is not None
                     else order_obj.get("average_fill_price_dollars")
                 )
-                avg_fee_raw = (
-                    order_obj.get("average_fee_paid")
-                    if order_obj.get("average_fee_paid") is not None
-                    else order_obj.get("average_fee_paid_dollars")
-                )
                 ts_ms = int(order_obj.get("ts_ms") or time.time() * 1000)
 
                 await self.telemetry.log_exchange_event(
@@ -1518,17 +1586,7 @@ class TradingEngine:
                 else:
                     actual_fill_price = evaluation.estimated_fill_price
 
-                if avg_fee_raw is not None:
-                    actual_fee = Decimal(str(avg_fee_raw))
-                    if actual_fee > Decimal("1") and filled_qty <= Decimal("10"):
-                        actual_fee = actual_fee / Decimal("100")
-                    actual_fee = actual_fee.quantize(Decimal("0.01"))
-                else:
-                    actual_fee = (
-                        calculate_taker_fee(filled_qty, actual_fill_price)
-                        if filled_qty > Decimal("0")
-                        else Decimal("0.00")
-                    )
+                actual_fee = order_fee_total(order_obj, filled_qty, actual_fill_price)
 
                 status = str(
                     order_obj.get("status")
@@ -1583,11 +1641,9 @@ class TradingEngine:
                     shadow_fee_dollars=shadow_rec.fee_dollars,
                 )
                 await self.telemetry.log_execution(rec)
-                if (
-                    filled_qty > Decimal("0")
-                    and fill_count_raw is not None
-                    and isinstance(self.rest_client.signer, KalshiSigner)
-                ):
+                if filled_qty > Decimal("0") and isinstance(self.rest_client.signer, KalshiSigner):
+                    # Also covers "executed" with no fill count: no fill was applied locally, so
+                    # rebuild positions from the exchange before the in-flight marker is cleared.
                     await self.sync_balance_from_api()
             except KalshiApiError as exc:
                 err = f"HTTP {exc.status_code}: {exc.message}"

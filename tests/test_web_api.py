@@ -772,7 +772,8 @@ async def test_v2_order_endpoints_cancellation_and_fill_reconciliation(tmp_path:
             "fill_count": "4",
             "remaining_count": "0",
             "average_fill_price": "0.4800",
-            "average_fee_paid": "0.07",
+            # Per-contract average (taker fee ceil(0.07*4*0.48*0.52) = $0.07 total / 4)
+            "average_fee_paid": "0.0175",
             "ts_ms": 1700000001000,
         }
         with (
