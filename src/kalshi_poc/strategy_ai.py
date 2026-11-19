@@ -10,6 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -29,18 +30,27 @@ from kalshi_poc.simulator import calculate_taker_fee
 
 logger = logging.getLogger(__name__)
 
+# Shadow research (2026-11-19): after a >=6c 1-minute mid move these books retraced ~7c on
+# average over the next 5 minutes, and momentum-continuation entries lost on almost every trade.
 MID_TREND_GUIDANCE = (
-    "Weigh mid_delta_5m heavily: do not buy YES (BID) into temporary Level-1 bid walls "
-    "when mid_delta_5m <= -0.05 (prefer ASK / Long NO momentum or HOLD during multi-minute "
-    "downtrends)."
+    "Short-term spikes in these markets mean-revert: do NOT enter in the direction of a sharp "
+    "mid_delta_15s or mid_delta_1m move (after a 1-minute move of 6+ cents the mid has "
+    "retraced ~7 cents on average over the next 5 minutes). Treat mid_delta_5m only as "
+    "context for the prevailing trend, never as a reason on its own to chase."
 )
 
 DEFAULT_BATCH_SYSTEM_PROMPT = (
     "You are an independent prediction-market microstructure research agent analyzing "
-    "a batch of live Kalshi orderbooks. Only propose a trade when the expected settlement "
-    "or short-term move exceeds $0.04 (4 cents) per contract AFTER crossing the current "
-    "spread; otherwise return [] (HOLD). "
+    "a batch of live Kalshi binary orderbooks. Only propose a trade when the expected "
+    "settlement or short-term move exceeds $0.04 (4 cents) per contract AFTER crossing the "
+    "current spread and paying roughly $0.02 per contract in taker fees; otherwise return [] "
+    "(HOLD). HOLD is the right answer most of the time. "
     f"{MID_TREND_GUIDANCE} "
+    "Use minutes_to_close: contracts settle at exactly 0 or 1, so the nearer the close, the "
+    "more the price reflects where the underlying sits relative to the strike, and the less "
+    "room a short-term move has to recover. New entries must be priced on their own side "
+    "(YES price for bid, 1 - limit for ask) at or above min_entry_price_own_side (when given) "
+    "and below max_entry_price_own_side. "
     "Return ONLY a valid JSON array of trade objects: "
     '{"ticker": "TICKER", "side": "bid"|"ask", "count": "2", '
     '"limit_price": "0.5200", "expected_edge_per_contract": "0.05", '
@@ -177,6 +187,7 @@ class BaseStrategy(ABC):
         portfolio: PortfolioState,
         positions_by_ticker: dict[str, Position] | None = None,
         force: bool = False,
+        market_expiries: dict[str, datetime] | None = None,
     ) -> BatchEvaluationResult:
         """Evaluate all active snapshots in one batched cycle."""
         result = BatchEvaluationResult()
@@ -554,6 +565,10 @@ class _LLMStrategyBase(BaseStrategy):
         self._last_llm_mids: dict[str, Decimal] = {}
         self._mid_history: dict[str, deque[tuple[float, Decimal]]] = {}
         self._mid_last_meta: dict[str, tuple[float, int]] = {}
+        # mid_delta_1m per ticker as shown in the latest prompt (used by the anti-chase filter)
+        self._prompt_mid_delta_1m: dict[str, Decimal] = {}
+        # ticker -> market close time (UTC), shared from the engine for minutes_to_close
+        self._market_expiries: dict[str, datetime] = {}
 
     def _record_mid_prices(self, snapshots: list[OrderbookSnapshot]) -> None:
         """Maintain a lightweight rolling ring buffer of mid-prices per ticker (15s, 60s, 300s)."""
@@ -676,6 +691,8 @@ class _LLMStrategyBase(BaseStrategy):
                 return True, f"spread_imbalance({snap.ticker})"
             mid = snap.mid_yes_price
             prev_mid = self._last_llm_mids.get(snap.ticker)
+            if not self.settings.llm_mid_move_trigger_enabled:
+                continue
             if mid is not None and prev_mid is not None and abs(mid - prev_mid) >= Decimal("0.02"):
                 return True, f"mid_move({snap.ticker})"
 
@@ -695,6 +712,7 @@ class _LLMStrategyBase(BaseStrategy):
             - portfolio.open_risk_collateral_dollars,
         )
         markets_payload = []
+        now_utc = datetime.now(timezone.utc)
         for snap in snapshots:
             mid = snap.mid_yes_price
             prev_mid = self._last_llm_mids.get(snap.ticker)
@@ -702,9 +720,15 @@ class _LLMStrategyBase(BaseStrategy):
             delta_15s = self._mid_delta_over_window(snap.ticker, mid, 15.0)
             delta_1m = self._mid_delta_over_window(snap.ticker, mid, 60.0)
             delta_5m = self._mid_delta_over_window(snap.ticker, mid, 300.0)
+            self._prompt_mid_delta_1m[snap.ticker] = delta_1m
+            exp = self._market_expiries.get(snap.ticker)
+            minutes_to_close = (
+                f"{max(0.0, (exp - now_utc).total_seconds() / 60.0):.1f}" if exp is not None else None
+            )
             markets_payload.append(
                 {
                     "ticker": snap.ticker,
+                    "minutes_to_close": minutes_to_close,
                     "best_yes_bid": str(snap.best_yes_bid),
                     "best_yes_ask": str(snap.best_yes_ask),
                     "spread": str(snap.yes_spread),
@@ -741,12 +765,41 @@ class _LLMStrategyBase(BaseStrategy):
             # 1 - limit for asks); the risk gate rejects anything at or above it.
             "max_entry_price_own_side": f"{self._entry_ceiling():.2f}",
             "open_positions": open_positions,
-            "markets": markets_payload,
         }
+        if self.settings.min_entry_price_own_side > Decimal("0"):
+            payload["min_entry_price_own_side"] = f"{self.settings.min_entry_price_own_side:.2f}"
+        if self.settings.anti_chase_max_move_1m > Decimal("0"):
+            # Entries whose 1m move already runs this far in the trade's direction are rejected
+            payload["max_mid_delta_1m_in_trade_direction"] = (
+                f"{self.settings.anti_chase_max_move_1m:.2f}"
+            )
+        payload["markets"] = markets_payload
         return (
             "Evaluate all markets below in one pass and return a JSON array of TradeIntent objects "
             f"(or [] if all are HOLD):\n{json.dumps(payload)}"
         )
+
+    def _entry_filter_reason(
+        self, ticker: str, side: OrderSide, own_side_px: Decimal, snap: OrderbookSnapshot
+    ) -> str | None:
+        """Deterministic entry filters from shadow research; returns a rejection reason or None."""
+        s = self.settings
+        if s.min_entry_price_own_side > Decimal("0") and own_side_px < s.min_entry_price_own_side:
+            return (
+                f"Entry {own_side_px} below min_entry_price_own_side "
+                f"{s.min_entry_price_own_side:.2f}"
+            )
+        if s.anti_chase_max_move_1m > Decimal("0"):
+            delta_1m = self._prompt_mid_delta_1m.get(ticker)
+            if delta_1m is None:
+                delta_1m = self._mid_delta_over_window(ticker, snap.mid_yes_price, 60.0)
+            move_in_trade_dir = delta_1m if side == OrderSide.BID else -delta_1m
+            if move_in_trade_dir >= s.anti_chase_max_move_1m:
+                return (
+                    f"Anti-chase: 1m mid move {move_in_trade_dir:+.4f} in trade direction "
+                    f">= {s.anti_chase_max_move_1m:.2f}"
+                )
+        return None
 
     def _entry_ceiling(self) -> Decimal:
         """Highest own-side entry price that still leaves room before the take-profit lock."""
@@ -945,6 +998,11 @@ class _LLMStrategyBase(BaseStrategy):
                         f"Entry {own_side_px} at/above max_entry_price_own_side {self._entry_ceiling():.2f}",
                     )
                     continue
+                if not is_reducing_exit:
+                    chase_reason = self._entry_filter_reason(ticker, side, own_side_px, snap)
+                    if chase_reason is not None:
+                        reject(item, "FILTERED", chase_reason)
+                        continue
 
                 count_dec = Decimal(str(item["count"]))
                 if is_reducing_exit and existing_pos is not None:
@@ -1005,10 +1063,13 @@ class _LLMStrategyBase(BaseStrategy):
         portfolio: PortfolioState,
         positions_by_ticker: dict[str, Position] | None = None,
         force: bool = False,
+        market_expiries: dict[str, datetime] | None = None,
     ) -> BatchEvaluationResult:
         if not snapshots:
             return BatchEvaluationResult()
 
+        if market_expiries is not None:
+            self._market_expiries = market_expiries
         pos_map = positions_by_ticker if positions_by_ticker is not None else portfolio.positions
         self._record_mid_prices(snapshots)
         ts_ms = int(time.time() * 1000)
